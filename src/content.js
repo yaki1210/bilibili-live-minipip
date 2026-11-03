@@ -406,6 +406,9 @@
       '.bmp-controls button:hover{background:rgba(255,255,255,.15)}',
       '.bmp-controls input[type=range]{width:80px;accent-color:#00aeec}',
       '.bmp-status{font:11px system-ui;color:#aaa;margin-left:auto;white-space:nowrap}',
+      '.bmp-badge{position:absolute;top:6px;right:8px;z-index:5;font:11px system-ui;' +
+        'color:rgba(255,255,255,.75);background:rgba(0,0,0,.45);padding:2px 6px;border-radius:4px;' +
+        'pointer-events:none;white-space:nowrap}',
       '.bmp-toast{position:absolute;left:50%;top:14px;transform:translateX(-50%);z-index:5;' +
         'padding:8px 14px;border-radius:6px;background:rgba(0,0,0,.75);color:#fff;font:13px system-ui;' +
         'display:none;pointer-events:none}',
@@ -458,7 +461,12 @@
     bar.append(status, playBtn, muteBtn, vol, dmBtn, closeBtn);
     d.body.append(bar);
 
-    state.ui = { bar, playBtn, muteBtn, dmBtn, center, layer, status, lastStatus: '', needsUnmute: false };
+    const badge = d.createElement('div');
+    badge.className = 'bmp-badge';
+    badge.textContent = '弹幕：—';
+    d.body.append(badge);
+
+    state.ui = { bar, playBtn, muteBtn, dmBtn, center, layer, status, badge, lastStatus: '', needsUnmute: false };
     state.renderer = new DanmakuRenderer(d, layer);
 
     centerBtn.addEventListener('click', () => {
@@ -834,8 +842,10 @@
   }
 
   function setDmStatus(text) {
+    state.dmText = text;
     if (state.ui) {
       if (state.ui.status) state.ui.status.textContent = text;
+      if (state.ui.badge) state.ui.badge.textContent = text + ' · ' + (state.dmCount || 0);
       if (state.ui.lastStatus === text) return;
       state.ui.lastStatus = text;
     }
@@ -1029,8 +1039,15 @@
 
   function connectDanmakuWs(url, auth) {
     if (state.ws) { try { state.ws.close(); } catch (_) { /* ignore */ } state.ws = null; }
+    // Create the socket in the PiP window when possible: that window stays visible and
+    // unthrottled while the page tab is in the background or the browser is minimized.
+    const win = state.pipWin && !state.pipWin.closed ? state.pipWin : null;
+    const WS = (win && win.WebSocket) || WebSocket;
+    const setI = win && win.setInterval ? win.setInterval.bind(win) : setInterval;
+    const clearI = win && win.clearInterval ? win.clearInterval.bind(win) : clearInterval;
+    const setT = win && win.setTimeout ? win.setTimeout.bind(win) : setTimeout;
     let ws;
-    try { ws = new WebSocket(url); } catch (e) {
+    try { ws = new WS(url); } catch (e) {
       logWarn('danmaku ws create failed', e.name, e.message);
       fallbackDanmaku();
       return;
@@ -1041,10 +1058,10 @@
     ws.onopen = () => {
       try {
         sendPacket(ws, 7, new TextEncoder().encode(JSON.stringify(auth)));
-        hb = setInterval(() => {
+        hb = setI(() => {
           try { sendPacket(ws, 2, new Uint8Array(0)); } catch (_) { /* ignore */ }
         }, 30000);
-        state.timers.push(hb);
+        state.dmCount = 0;
         logInfo('danmaku ws open', url);
         setDmStatus('弹幕：WebSocket');
       } catch (e) {
@@ -1054,15 +1071,14 @@
     ws.onmessage = (ev) => parseWsPayload(ev.data);
     ws.onerror = () => logWarn('danmaku ws error');
     ws.onclose = (ev) => {
-      if (hb) { try { clearInterval(hb); } catch (_) { /* ignore */ } }
+      if (hb) { try { clearI(hb); } catch (_) { /* ignore */ } }
       if (state.phase !== 'active' && state.phase !== 'opening') return;
       const n = (state.wsRetry || 0) + 1;
       state.wsRetry = n;
       logWarn('danmaku ws closed; retry', n, ev && ev.code, ev && ev.reason);
       setDmStatus('弹幕：断开重试 ' + n);
       if (n <= 3) {
-        const id = setTimeout(() => connectDanmakuWs(url, auth), 3000);
-        state.timers.push(id);
+        setT(() => connectDanmakuWs(url, auth), 3000);
       } else {
         fallbackDanmaku();
       }
@@ -1171,7 +1187,13 @@
     }
     const uname = Array.isArray(info[2]) ? String(info[2][1] || '') : '';
     const color = colorOf(String(info[3] == null ? '' : info[3]));
-    if (state.renderer) state.renderer.push({ segments: [{ type: 'text', text: t }], color, uname, text: t });
+    if (state.renderer) {
+      state.renderer.push({ segments: [{ type: 'text', text: t }], color, uname, text: t });
+      state.dmCount = (state.dmCount || 0) + 1;
+      if (state.ui && state.ui.badge) {
+        state.ui.badge.textContent = (state.dmText || '弹幕') + ' · ' + state.dmCount;
+      }
+    }
   }
 
   function startDomDanmaku() {
@@ -1191,6 +1213,7 @@
       }
       const { root, kind, doc } = found;
       const View = doc.defaultView;
+      if (!View || !root || root.nodeType !== 1) { logWarn('danmaku root invalid'); return; }
       const MO = View.MutationObserver;
       const seen = new WeakSet();
       const handle = (el) => {
