@@ -24,6 +24,9 @@
     timers: [],
     ui: {},
     barTimer: 0,
+    wsListening: false,
+    wsSeen: null,
+    wsChain: null,
   };
 
   const logInfo = (...a) => console.info(TAG, ...a);
@@ -786,6 +789,115 @@
   }
 
   function startDanmaku() {
+    if (wsAvailable()) { startWsDanmaku(); return; }
+    startDomDanmaku();
+  }
+
+  function wsAvailable() {
+    try { if (document.documentElement.hasAttribute('data-bmp-ws')) return true; } catch (_) { /* ignore */ }
+    try {
+      const td = window.top.document;
+      return !!(td && td.documentElement && td.documentElement.hasAttribute('data-bmp-ws'));
+    } catch (_) { return false; }
+  }
+
+  function startWsDanmaku() {
+    if (state.wsListening) return;
+    state.wsListening = true;
+    state.wsSeen = new Set();
+    state.wsChain = Promise.resolve();
+    const onMsg = (ev) => {
+      const d = ev.data;
+      if (!d || !d.__bmpWs) return;
+      if (!state.renderer) return;
+      if (state.phase !== 'active' && state.phase !== 'opening') return;
+      parseWsPayload(d.data);
+    };
+    window.addEventListener('message', onMsg);
+    state.listeners.push({ target: window, type: 'message', fn: onMsg });
+    if (!isTopFrame) {
+      try {
+        window.top.addEventListener('message', onMsg);
+        state.listeners.push({ target: window.top, type: 'message', fn: onMsg });
+      } catch (_) { /* cross-origin */ }
+    }
+    logInfo('danmaku source ws (page socket tap)');
+  }
+
+  let wsWarned = false;
+  function parseWsPayload(data) {
+    try {
+      if (typeof data === 'string') { parseDanmuJson(data); return; }
+      let buf = null;
+      if (data instanceof ArrayBuffer) buf = data;
+      else if (ArrayBuffer.isView(data)) buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+      if (!buf) return;
+      const run = () => parseWsBuffer(buf).catch((e) => {
+        if (!wsWarned) { wsWarned = true; logWarn('ws parse failed', e.name, e.message); }
+      });
+      state.wsChain = (state.wsChain || Promise.resolve()).then(run, run);
+    } catch (e) {
+      if (!wsWarned) { wsWarned = true; logWarn('ws payload failed', e.name, e.message); }
+    }
+  }
+
+  async function parseWsBuffer(buf) {
+    let off = 0;
+    while (off + 16 <= buf.byteLength) {
+      const dv = new DataView(buf, off);
+      const total = dv.getUint32(0);
+      const headLen = dv.getUint16(4);
+      const ver = dv.getUint16(6);
+      const op = dv.getUint32(8);
+      if (total < headLen || off + total > buf.byteLength) break;
+      const body = new Uint8Array(buf, off + headLen, total - headLen);
+      if (ver === 2) {
+        try {
+          const out = await inflateZlib(body);
+          await parseWsBuffer(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+        } catch (e) {
+          if (!wsWarned) { wsWarned = true; logWarn('ws inflate failed', e.name, e.message); }
+        }
+      } else if (ver === 3) {
+        if (!wsWarned) { wsWarned = true; logWarn('ws brotli frame; protover 2 was not applied'); }
+      } else if (op === 5) {
+        parseDanmuJson(new TextDecoder().decode(body));
+      }
+      off += total;
+    }
+  }
+
+  async function inflateZlib(bytes) {
+    if (typeof DecompressionStream === 'undefined') throw new Error('DecompressionStream unavailable');
+    const ds = new DecompressionStream('deflate');
+    const stream = new Blob([bytes]).stream().pipeThrough(ds);
+    const ab = await new Response(stream).arrayBuffer();
+    return new Uint8Array(ab);
+  }
+
+  function parseDanmuJson(text) {
+    let obj;
+    try { obj = JSON.parse(text); } catch (_) { return; }
+    const cmd = String(obj.cmd || '');
+    if (!cmd.startsWith('DANMU_MSG')) return;
+    const info = obj.info;
+    if (!Array.isArray(info)) return;
+    const t = String(info[1] || '').trim();
+    if (!t) return;
+    const uid = Array.isArray(info[2]) ? String(info[2][0] || '') : '';
+    const ts = Array.isArray(info[0]) ? String(info[0][4] || '') : '';
+    const key = uid + '|' + ts + '|' + t;
+    if (state.wsSeen) {
+      if (state.wsSeen.has(key)) return;
+      state.wsSeen.add(key);
+      if (state.wsSeen.size > 800) state.wsSeen.clear();
+    }
+    const uname = Array.isArray(info[2]) ? String(info[2][1] || '') : '';
+    const color = colorOf(String(info[3] == null ? '' : info[3]));
+    if (state.renderer) state.renderer.push({ segments: [{ type: 'text', text: t }], color, uname, text: t });
+  }
+
+  function startDomDanmaku() {
     let tries = 0;
     const attempt = () => {
       if (state.phase !== 'active' && state.phase !== 'opening') return;
@@ -913,6 +1025,9 @@
     state.sourceVideo = null;
     state.dm = null;
     state.ui = {};
+    state.wsListening = false;
+    state.wsSeen = null;
+    state.wsChain = null;
     state.phase = 'idle';
     logInfo('closed', reason);
   }

@@ -33,3 +33,82 @@
   };
   dpip.__bmpPatched = true;
 })();
+
+// MAIN world: tap the page's own live danmaku WebSocket. DOM-based danmaku stops when the
+// tab is hidden (Bilibili stops updating the chat list), but the socket keeps receiving.
+// We ask the server for protover 2 (zlib) instead of brotli, forward every frame to the
+// content script, and it renders into the Document PiP window (which stays visible).
+(() => {
+  const Orig = window.WebSocket;
+  if (!Orig || Orig.__bmpWsPatched) return;
+  const DANMU_URL = /\/sub(\?|$)|broadcastlv|chat\.bilibili\.com/i;
+
+  function isDanmuUrl(url) {
+    try { return DANMU_URL.test(String(url)); } catch (_) { return false; }
+  }
+
+  // The auth packet is op 7, ver 1, JSON body. Switch protover 3 (brotli) to 2 (zlib);
+  // the page's own parser handles the zlib frames by their version field.
+  function patchAuth(data) {
+    try {
+      let buf = null;
+      if (data instanceof ArrayBuffer) buf = data;
+      else if (ArrayBuffer.isView(data)) buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+      if (!buf || buf.byteLength < 16) return data;
+      const dv = new DataView(buf);
+      const total = dv.getUint32(0);
+      const headLen = dv.getUint16(4);
+      const op = dv.getUint32(8);
+      if (op !== 7 || total < headLen || total > buf.byteLength) return data;
+      const text = new TextDecoder().decode(new Uint8Array(buf, headLen, total - headLen));
+      const obj = JSON.parse(text);
+      if (!obj || typeof obj !== 'object') return data;
+      obj.protover = 2;
+      const body = new TextEncoder().encode(JSON.stringify(obj));
+      const out = new ArrayBuffer(headLen + body.byteLength);
+      const odv = new DataView(out);
+      odv.setUint32(0, out.byteLength);
+      odv.setUint16(4, headLen);
+      odv.setUint16(6, dv.getUint16(6));
+      odv.setUint32(8, op);
+      odv.setUint32(12, dv.getUint32(12));
+      new Uint8Array(out, headLen).set(body);
+      return out;
+    } catch (_) { return data; }
+  }
+
+  function forward(data) {
+    try {
+      const post = (d) => {
+        try { window.top.postMessage({ __bmpWs: true, data: d }, '*'); } catch (_) { /* ignore */ }
+      };
+      if (typeof Blob !== 'undefined' && data instanceof Blob) {
+        data.arrayBuffer().then(post).catch(() => {});
+        return;
+      }
+      if (data instanceof ArrayBuffer) { post(data); return; }
+      if (ArrayBuffer.isView(data)) {
+        post(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+        return;
+      }
+      if (typeof data === 'string') post(data);
+    } catch (_) { /* ignore */ }
+  }
+
+  function Patched(url, protocols) {
+    const ws = protocols === undefined ? new Orig(url) : new Orig(url, protocols);
+    if (!isDanmuUrl(url)) return ws;
+    try {
+      const send = ws.send.bind(ws);
+      ws.send = function (d) { return send(patchAuth(d)); };
+      ws.addEventListener('message', (ev) => forward(ev.data));
+      document.documentElement.setAttribute('data-bmp-ws', '1');
+      console.info('[bmp] ws hooked', String(url));
+    } catch (_) { /* ignore */ }
+    return ws;
+  }
+  Patched.prototype = Orig.prototype;
+  for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) Patched[k] = Orig[k];
+  Patched.__bmpWsPatched = true;
+  window.WebSocket = Patched;
+})();
