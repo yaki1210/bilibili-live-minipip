@@ -27,12 +27,28 @@
     wsListening: false,
     wsSeen: null,
     wsChain: null,
+    ws: null,
+    wsRetry: 0,
   };
 
   const logInfo = (...a) => console.info(TAG, ...a);
   const logWarn = (...a) => console.warn(TAG, ...a);
   const logErr = (...a) => console.error(TAG, ...a);
   const vstat = (v) => v && ({ paused: v.paused, ready: v.readyState, w: v.videoWidth, h: v.videoHeight });
+
+  // Danmaku server config from the page (posted by main-guard from window.__danmuInfo).
+  let danmuInfo = null;
+  function onDanmuInfo(ev) {
+    const d = ev.data;
+    if (d && d.__bmpDanmuInfo && d.info) {
+      danmuInfo = d.info;
+      logInfo('danmu info received');
+    }
+  }
+  window.addEventListener('message', onDanmuInfo);
+  if (!isTopFrame) {
+    try { window.top.addEventListener('message', onDanmuInfo); } catch (_) { /* cross-origin */ }
+  }
 
   // ---------- window helpers ----------
   function getTopDpip() {
@@ -789,8 +805,153 @@
   }
 
   function startDanmaku() {
+    state.wsSeen = state.wsSeen || new Set();
+    state.wsChain = state.wsChain || Promise.resolve();
+    startDanmuSource().catch((e) => logWarn('danmaku start failed', e.name, e.message));
+  }
+
+  async function startDanmuSource() {
+    const info = await waitDanmuInfo(4000);
+    if (state.phase !== 'active' && state.phase !== 'opening') return;
+    if (info) { startOwnWs(info); return; }
+    const roomid = await resolveRoomId(null);
+    if (state.phase !== 'active' && state.phase !== 'opening') return;
+    if (roomid) {
+      const apiInfo = await fetchDanmuInfo(roomid);
+      if (state.phase !== 'active' && state.phase !== 'opening') return;
+      if (apiInfo) { startOwnWs(apiInfo); return; }
+    }
     if (wsAvailable()) { startWsDanmaku(); return; }
     startDomDanmaku();
+  }
+
+  async function fetchDanmuInfo(roomid) {
+    try {
+      const r = await fetch('https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?id=' + roomid + '&type=0', { credentials: 'include' }).then((x) => x.json());
+      if (r && r.data && r.data.token && r.data.host_list && r.data.host_list.length) return r;
+      logWarn('getDanmuInfo refused', r && r.code, r && r.message);
+    } catch (e) { logWarn('getDanmuInfo failed', e.name, e.message); }
+    return null;
+  }
+
+  function waitDanmuInfo(ms) {
+    if (danmuInfo) return Promise.resolve(danmuInfo);
+    return new Promise((resolve) => {
+      const t0 = Date.now();
+      const tick = () => {
+        if (danmuInfo) return resolve(danmuInfo);
+        if (Date.now() - t0 >= ms) return resolve(null);
+        setTimeout(tick, 200);
+      };
+      tick();
+    });
+  }
+
+  async function startOwnWs(info) {
+    const data = (info && info.data) || info || {};
+    const token = data.token;
+    const hosts = data.host_list || [];
+    if (!token || !hosts.length) { fallbackDanmaku(); return; }
+    const h = hosts[0];
+    const url = 'wss://' + h.host + ':' + h.wss_port + '/sub';
+    const roomid = await resolveRoomId(data);
+    const uid = await fetchUid();
+    if (state.phase !== 'active' && state.phase !== 'opening') return;
+    const buvid = readCookie('buvid3');
+    logInfo('danmaku ws connect', { url, roomid, uid, buvid: !!buvid });
+    connectDanmakuWs(url, { uid, roomid, protover: 2, platform: 'web', type: 2, key: token, buvid, clientver: '1.14.3' });
+  }
+
+  function fallbackDanmaku() {
+    if (wsAvailable()) startWsDanmaku();
+    else startDomDanmaku();
+  }
+
+  function pageRoomId() {
+    let path = location.pathname;
+    if (!/\/(\d+)(\/|$)/.test(path) && !isTopFrame) {
+      try { path = window.top.location.pathname; } catch (_) { /* cross-origin */ }
+    }
+    const m = path.match(/\/(\d+)(\/|$)/);
+    return m ? Number(m[1]) : 0;
+  }
+
+  async function resolveRoomId(data) {
+    if (data && data.room_id) return data.room_id;
+    const short = pageRoomId();
+    if (!short) return 0;
+    try {
+      const r = await fetch('https://api.live.bilibili.com/room/v1/Room/mobileRoomInit?id=' + short, { credentials: 'include' }).then((x) => x.json());
+      if (r && r.data && r.data.room_id) return r.data.room_id;
+    } catch (_) { /* ignore */ }
+    return short;
+  }
+
+  async function fetchUid() {
+    try {
+      const r = await fetch('https://api.bilibili.com/x/web-interface/nav', { credentials: 'include' }).then((x) => x.json());
+      return r && r.data && r.data.mid ? r.data.mid : 0;
+    } catch (_) { return 0; }
+  }
+
+  function readCookie(name) {
+    try {
+      const m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+      return m ? decodeURIComponent(m[1]) : '';
+    } catch (_) { return ''; }
+  }
+
+  function sendPacket(ws, op, body, ver) {
+    const head = 16;
+    const buf = new ArrayBuffer(head + body.byteLength);
+    const dv = new DataView(buf);
+    dv.setUint32(0, buf.byteLength);
+    dv.setUint16(4, head);
+    dv.setUint16(6, ver == null ? 1 : ver);
+    dv.setUint32(8, op);
+    dv.setUint32(12, 1);
+    new Uint8Array(buf, head).set(body);
+    ws.send(buf);
+  }
+
+  function connectDanmakuWs(url, auth) {
+    if (state.ws) { try { state.ws.close(); } catch (_) { /* ignore */ } state.ws = null; }
+    let ws;
+    try { ws = new WebSocket(url); } catch (e) {
+      logWarn('danmaku ws create failed', e.name, e.message);
+      fallbackDanmaku();
+      return;
+    }
+    state.ws = ws;
+    ws.binaryType = 'arraybuffer';
+    let hb = 0;
+    ws.onopen = () => {
+      try {
+        sendPacket(ws, 7, new TextEncoder().encode(JSON.stringify(auth)));
+        hb = setInterval(() => {
+          try { sendPacket(ws, 2, new Uint8Array(0)); } catch (_) { /* ignore */ }
+        }, 30000);
+        state.timers.push(hb);
+        logInfo('danmaku ws open', url);
+      } catch (e) {
+        logWarn('danmaku ws auth failed', e.name, e.message);
+      }
+    };
+    ws.onmessage = (ev) => parseWsPayload(ev.data);
+    ws.onerror = () => logWarn('danmaku ws error');
+    ws.onclose = () => {
+      if (hb) { try { clearInterval(hb); } catch (_) { /* ignore */ } }
+      if (state.phase !== 'active' && state.phase !== 'opening') return;
+      const n = (state.wsRetry || 0) + 1;
+      state.wsRetry = n;
+      logWarn('danmaku ws closed; retry', n);
+      if (n <= 3) {
+        const id = setTimeout(() => connectDanmakuWs(url, auth), 3000);
+        state.timers.push(id);
+      } else {
+        fallbackDanmaku();
+      }
+    };
   }
 
   function wsAvailable() {
@@ -946,6 +1107,7 @@
   }
 
   function stopDanmaku() {
+    if (state.ws) { try { state.ws.close(); } catch (_) { /* ignore */ } state.ws = null; }
     if (state.dm && state.dm.observer) {
       try { state.dm.observer.disconnect(); } catch (_) { /* ignore */ }
     }
@@ -1028,6 +1190,8 @@
     state.wsListening = false;
     state.wsSeen = null;
     state.wsChain = null;
+    state.ws = null;
+    state.wsRetry = 0;
     state.phase = 'idle';
     logInfo('closed', reason);
   }

@@ -112,3 +112,27 @@
   Patched.__bmpWsPatched = true;
   window.WebSocket = Patched;
 })();
+
+// MAIN world: expose the page's danmaku server config (token/host) to the content script.
+// Bilibili sets window.__danmuInfo after the player boots; poll briefly, then post it once.
+(() => {
+  if (window.__bmpDanmuInfoPosted) return;
+  let tries = 0;
+  const timer = setInterval(() => {
+    tries++;
+    const info = window.__danmuInfo;
+    if (info && info.data && info.data.token) {
+      clearInterval(timer);
+      window.__bmpDanmuInfoPosted = true;
+      try {
+        window.top.postMessage({ __bmpDanmuInfo: true, info: JSON.parse(JSON.stringify(info)) }, '*');
+        document.documentElement.setAttribute('data-bmp-danmu-info', '1');
+        console.info('[bmp] __danmuInfo captured');
+      } catch (e) {
+        console.warn('[bmp] __danmuInfo not cloneable', e && e.name);
+      }
+    } else if (tries > 40) {
+      clearInterval(timer);
+    }
+  }, 500);
+})();

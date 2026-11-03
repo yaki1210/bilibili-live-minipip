@@ -1,4 +1,4 @@
-# bilibili-live-minipip (M2) — 0.2.1
+# bilibili-live-minipip (M2) — 0.2.2
 
 Chrome MV3 extension: the live player's native **小窗模式** button opens a real, always-on-top
 mini window with the live picture and live danmaku. The page player keeps playing; no page is
@@ -23,6 +23,18 @@ reloaded and no second stream is pulled.
 3. Open `https://live.bilibili.com/<room>`, hover the player -> click 小窗模式.
 4. Close the mini window (关闭 / Esc / window close) -> page audio returns, player keeps running.
 5. Filter the DevTools console by `[bmp]` for logs.
+
+## Notes (0.2.2)
+
+- **Own danmaku socket**: 0.2.1 patched the page's WebSocket, but that missed the real connection
+  in some rooms. 0.2.2 reads the page's `window.__danmuInfo` (main-guard posts it over), falls back
+  to `getDanmuInfo` if needed, and opens its own `wss://<host>:<port>/sub` socket with
+  `protover 2` (zlib), heartbeat, and auto-reconnect. This socket lives in the content script and
+  keeps receiving while the browser is minimized; frames are rendered into the PiP window.
+- Order of danmaku sources: own socket -> page socket tap (0.2.1) -> DOM observer (last resort).
+- Console markers: `[bmp] __danmuInfo captured`, `[bmp] danmaku ws connect`,
+  `[bmp] danmaku ws open`. If it closes, `danmaku ws closed; retry` up to 3 times, then the DOM
+  fallback (which stops when minimized).
 
 ## Notes (0.2.1)
 
