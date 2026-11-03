@@ -982,7 +982,11 @@
     const dpip = getTopDpip();
     if (dpip && dpip.window) { try { dpip.window.close(); } catch (_) { /* ignore */ } return; }
     logInfo('toggle via', src, '(open)');
-    openMini().catch((e) => { logErr('openMini failed', e); toastPage('打开小窗失败'); });
+    openMini().catch((e) => {
+      logErr('openMini failed', e);
+      toastPage('打开小窗失败');
+      cleanup('open-failed');
+    });
   }
 
   window.addEventListener('bmp:pip-request', () => {
