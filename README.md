@@ -1,4 +1,4 @@
-# bilibili-live-minipip (M1) — 0.1.6
+# bilibili-live-minipip (M1) — 0.1.7
 
 Chrome MV3 extension: clicking the live player's native **小窗模式** button opens our own
 Document Picture-in-Picture window containing the live `<video>` (no danmaku yet — M2).
@@ -24,7 +24,15 @@ Debug: page DevTools console, filter `[bmp]`.
 
 - 0.1.5: iframe rooms → mirror mode (player stays on page, PiP shows `captureStream()`, audio from original); same-frame rooms move whole player, kick play/resize, fall back to mirror if not playing after ~1.8s.
 
-- 0.1.6: back to moving the whole `#live-player` (no captureStream). PiP is requested from the document that owns the player (Chromium keeps the media player only then). In iframe rooms, where Chrome refuses iframe Doc PiP, the real player becomes a draggable/resizable in-page floating mini window (same nodes, controls + danmaku).
+- 0.1.6: back to moving the whole `#live-player` (no captureStream). PiP is requested from the document that owns the player (Chromium keeps the media player only then).
+
+- 0.1.7 (**fix: real top-level window**): Document PiP cannot be requested from an iframe, so
+  0.1.6 fell back to an in-page float *inside the player iframe* — it was clipped by the player
+  area and never a real top-level window. Now an iframe room requests the PiP window from the
+  **top document** and loads a fresh copy of the player page into it as an iframe; the PiP child
+  then isolates `#live-player` (hides the rest of the page, pins the player to the viewport,
+  starts playback/unmute). The page's own player is paused while the PiP is open and resumed on
+  close. The in-page float only remains as a fallback when the top document is cross-origin.
 
 ## Files
 - `manifest.json` — MV3, two content scripts on `*://live.bilibili.com/*` (`all_frames`).

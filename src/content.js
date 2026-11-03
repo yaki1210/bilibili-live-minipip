@@ -1,42 +1,141 @@
-// Bilibili Live mini-player — M1: hijack native 「小窗模式」 → our Document PiP with the live <video>.
+// Bilibili Live mini-player — M1.7: hijack native 「小窗模式」 → real top-level Document PiP.
+// 0.1.7: iframe rooms request the PiP window from the TOP document (Chrome refuses Document PiP
+// inside an iframe) and embed a fresh playback iframe in it. This is a real OS-level always-on-top
+// window that can leave the player area. The old in-page float stays only as a last resort.
 (() => {
-  if (window.top !== window && !document.querySelector('#live-player')) {
-    // iframe rooms: only act if the player lives here (checked again lazily below)
-  }
   const TAG = '[bmp]';
   const PIP_TEXT = /^(退出)?小窗模式$/;
   const SEL = { player: '#live-player', video: '#live-player video' };
+  const isTopFrame = window.self === window.top;
+
   let pipWin = null;
-  let restore = null; // {video, parent, next, style}
+  let pipKind = null;    // 'move' (top document moves the player) | 'iframe' (PiP embeds an iframe)
+  let restore = null;    // 'move': {player, parent, next, style, ph}
+  let pipState = null;   // 'iframe': {win, video, before}
+  let floatState = null; // last resort: in-page float window (same document)
   let lastHover = null;
 
-  // Native Document PiP must run on a top-level browsing context. When the
-  // live player lives in a same-origin iframe, resolve the API from top.
-  function getDpip() {
+  // ---------- PiP child document: this page was loaded inside our PiP window ----------
+  function isPipChild() {
+    if (isTopFrame) return false;
     try {
-      if (window.top && window.top !== window) {
-        if (window.top.documentPictureInPicture)
-          return window.top.documentPictureInPicture;
-        return null;
-      }
-    } catch (_) {
-      // cross-origin top: cannot use top's API from this frame
-      return null;
-    }
-    return window.documentPictureInPicture || null;
+      return !!(window.top.document && window.top.document.documentElement &&
+        window.top.document.documentElement.hasAttribute('data-bmp-pip-host'));
+    } catch (_) { return false; }
   }
 
-  if (!getDpip() && !('documentPictureInPicture' in window)) {
-    console.warn(TAG, 'Document PiP not available here; will use in-page float window');
+  if (isPipChild()) { initPipChild(); return; }
+
+  function initPipChild() {
+    console.info(TAG, 'PiP child document: isolating #live-player');
+    const st = document.createElement('style');
+    st.textContent = 'html{background:#000!important}body{margin:0!important;padding:0!important;' +
+      'overflow:hidden!important;background:#000!important}';
+    (document.head || document.documentElement).append(st);
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { try { window.top.close(); } catch (_) { /* ignore */ } }
+    }, true);
+
+    let isolated = false;
+    let tries = 0;
+    const tick = () => {
+      const player = document.querySelector(SEL.player);
+      if (player) {
+        if (!isolated) { isolated = true; isolatePlayer(player); }
+        const v = player.querySelector('video');
+        if (v) autoPlay(v);
+      }
+      if (tries++ < 30) setTimeout(tick, 400); // ~12s: player boot
+    };
+    tick();
   }
+
+  // Hide every sibling subtree that does not contain the player, all the way up to <body>,
+  // then pin the player to the viewport. Works for both the player page and a full room page.
+  function isolatePlayer(player) {
+    let node = player;
+    while (node && node !== document.body) {
+      const parent = node.parentElement;
+      if (!parent) break;
+      for (const sib of parent.children) {
+        if (sib !== node) sib.style.setProperty('display', 'none', 'important');
+      }
+      if (parent !== document.body) {
+        const clear = [
+          ['position', 'static'], ['transform', 'none'], ['filter', 'none'],
+          ['overflow', 'visible'], ['width', 'auto'], ['height', 'auto'],
+          ['max-width', 'none'], ['max-height', 'none'], ['min-width', '0'],
+          ['min-height', '0'], ['display', 'block']
+        ];
+        for (const [k, v] of clear) parent.style.setProperty(k, v, 'important');
+      }
+      node = parent;
+    }
+    const b = document.body;
+    if (b) {
+      b.style.setProperty('margin', '0', 'important');
+      b.style.setProperty('padding', '0', 'important');
+      b.style.setProperty('overflow', 'hidden', 'important');
+      b.style.setProperty('background', '#000', 'important');
+    }
+    document.documentElement.style.setProperty('background', '#000', 'important');
+    const pin = [
+      ['position', 'fixed'], ['inset', '0'], ['width', '100vw'], ['height', '100vh'],
+      ['z-index', '2147483647'], ['transform', 'none'], ['margin', '0'],
+      ['border-radius', '0'], ['overflow', 'hidden']
+    ];
+    for (const [k, v] of pin) player.style.setProperty(k, v, 'important');
+    try { window.dispatchEvent(new Event('resize')); } catch (_) { /* ignore */ }
+  }
+
+  function autoPlay(v) {
+    if (v.__bmpAutoplay) return;
+    v.__bmpAutoplay = true;
+    const attempt = (muted, left) => {
+      if (muted) v.muted = true;
+      let p;
+      try { p = v.play(); } catch (_) { return; }
+      if (!p || !p.catch) return;
+      p.catch((e) => {
+        if (e && e.name === 'NotAllowedError' && !muted) return attempt(true, left);
+        if (left > 0) setTimeout(() => attempt(muted, left - 1), 700);
+        else showUnmute(v);
+      });
+    };
+    attempt(false, 3);
+  }
+
+  function showUnmute(v) {
+    if (document.getElementById('bmp-unmute')) return;
+    const b = document.createElement('button');
+    b.id = 'bmp-unmute';
+    b.textContent = '点击开启声音';
+    b.style.cssText = 'position:fixed;left:50%;top:16px;transform:translateX(-50%);' +
+      'z-index:2147483647;padding:8px 16px;border:0;border-radius:6px;background:#00aeec;' +
+      'color:#fff;font:14px/1.4 system-ui;cursor:pointer;box-shadow:0 2px 12px rgba(0,0,0,.45)';
+    b.addEventListener('click', () => {
+      v.muted = false;
+      try { const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* ignore */ }
+      b.remove();
+    });
+    (document.body || document.documentElement).append(b);
+  }
+
+  // ---------- normal page (top document or the player iframe) ----------
+  function getTopDpip() {
+    if (isTopFrame) return window.documentPictureInPicture || null;
+    try { return window.top.documentPictureInPicture || null; } catch (_) { return null; }
+  }
+
+  if (!getTopDpip()) console.warn(TAG, 'no usable Document PiP here; in-page float is the fallback');
   document.documentElement.setAttribute('data-bmp-hijack', '1');
 
   const txt = (el) => (el && (el.getAttribute?.('aria-label') || el.getAttribute?.('title') ||
     el.getAttribute?.('data-title') || el.getAttribute?.('data-tooltip') || '')).trim();
 
-  // Visible tooltip somewhere in the player saying 小窗模式 / 退出小窗模式
+  // Visible tooltip somewhere in the page saying 小窗模式 / 退出小窗模式
   function visibleTooltipMatches() {
-    // Tooltips may portal outside #live-player — walk the whole document.
     const root = document.body;
     if (!root) return false;
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -137,10 +236,8 @@
   console.info(TAG, 'armed in', location.href);
   window.addEventListener('pointerover', (ev) => { lastHover = ev.target; }, true);
 
-  // 0.1.4: detach the WHOLE original player (#live-player: video + danmaku layer + controls)
-  // into the top-level Document PiP window, instead of a bare <video> in a self-drawn shell.
-  // Same DOM nodes are moved (not cloned), so decoding, audio, danmaku and player JS keep running.
   const info = (el) => el && ({ connected: el.isConnected, doc: el.ownerDocument?.location?.href || '(pip)' });
+  const vstat = (v) => v && ({ paused: v.paused, readyState: v.readyState, w: v.videoWidth, h: v.videoHeight });
 
   function copyStyles(fromDoc, toDoc) {
     let n = 0;
@@ -160,14 +257,6 @@
     return n;
   }
 
-  // 0.1.6: same-document rule. Chromium keeps the media player when a <video> moves into a
-  // Doc PiP window opened by its OWN document; otherwise the player is destroyed (endless loading).
-  // So: top frame → Doc PiP (move whole #live-player). Iframe → try the iframe's own
-  // requestWindow; if the browser refuses (top-level only), float the real #live-player
-  // as an in-page mini window (same nodes, same document, controls + danmaku intact).
-  let floatState = null; // {player, ph, parent, next, style}
-  const vstat = (v) => v && ({ paused: v.paused, readyState: v.readyState, w: v.videoWidth, h: v.videoHeight });
-
   async function openPip() {
     const player = document.querySelector(SEL.player);
     const video = document.querySelector(SEL.video);
@@ -175,19 +264,102 @@
     if (floatState) { closeFloat(); return; }
     const vw = video?.videoWidth || 16, vh = video?.videoHeight || 9;
     const width = 480, height = Math.round(width * vh / vw);
+    if (isTopFrame) await openPipInTop(player, video, width, height);
+    else await openPipInFrame(player, video, width, height);
+  }
 
-    const own = window.documentPictureInPicture;
-    if (own) {
-      console.info(TAG, 'requestWindow from own document', window.top !== window ? '(iframe)' : '(top)', width, height);
-      setBmpSelf(true);
-      try { pipWin = await own.requestWindow({ width, height }); }
-      catch (e) {
-        console.warn(TAG, 'own-document requestWindow refused → in-page float window', e.name, e.message);
-        pipWin = null;
-      } finally { setBmpSelf(false); }
-    }
+  // Top document: moving #live-player into a PiP opened by its own document keeps the media element.
+  async function openPipInTop(player, video, width, height) {
+    const dpip = window.documentPictureInPicture;
+    if (!dpip) { openFloat(player, video, width, height); return; }
+    console.info(TAG, 'top: requestWindow', width, height);
+    setBmpSelf(true);
+    try { pipWin = await dpip.requestWindow({ width, height }); }
+    catch (e) {
+      pipWin = null;
+      console.warn(TAG, 'top requestWindow refused → in-page float', e.name, e.message);
+    } finally { setBmpSelf(false); }
     if (!pipWin) { openFloat(player, video, width, height); return; }
+    pipKind = 'move';
     movePlayerIntoPip(player, video, width, height);
+  }
+
+  // iframe: Document PiP is top-level only. Ask the TOP document for the window and load a fresh
+  // copy of this player page inside it (moving nodes across documents destroys the media element).
+  async function openPipInFrame(player, video, width, height) {
+    const dpip = getTopDpip();
+    if (!dpip) {
+      console.warn(TAG, 'iframe: top Doc PiP unreachable (cross-origin top?) → in-page float');
+      openFloat(player, video, width, height);
+      return;
+    }
+    console.info(TAG, 'iframe: requestWindow via top document', width, height);
+    setBmpSelf(true);
+    try { pipWin = await dpip.requestWindow({ width, height }); }
+    catch (e) {
+      pipWin = null;
+      console.warn(TAG, 'iframe: top requestWindow refused → in-page float', e.name, e.message);
+    } finally { setBmpSelf(false); }
+    if (!pipWin) { openFloat(player, video, width, height); return; }
+    pipKind = 'iframe';
+    mountIframePip(pipWin, video, width, height);
+  }
+
+  function pipSourceUrl() {
+    if (/^https?:/i.test(location.href)) return location.href;
+    try {
+      if (/^https?:/i.test(window.top.location.href)) return window.top.location.href;
+    } catch (_) { /* cross-origin */ }
+    return location.href;
+  }
+
+  function mountIframePip(win, video, width, height) {
+    const d = win.document;
+    d.documentElement.setAttribute('data-bmp-pip-host', '1');
+    d.title = 'Bilibili Live 小窗';
+    const st = d.createElement('style');
+    st.textContent = 'html,body{margin:0!important;padding:0!important;width:100%;height:100%;' +
+      'background:#000!important;overflow:hidden!important}' +
+      'iframe.bmp-pip-frame{border:0;display:block;width:100%;height:100%;background:#000}';
+    (d.head || d.documentElement).append(st);
+
+    const f = d.createElement('iframe');
+    f.className = 'bmp-pip-frame';
+    f.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture; encrypted-media');
+    f.setAttribute('allowfullscreen', 'true');
+    const src = pipSourceUrl();
+    f.src = src;
+    d.body.append(f);
+
+    const hint = d.createElement('div');
+    hint.textContent = '正在打开小窗…';
+    hint.style.cssText = 'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;' +
+      'background:#000;color:#aaa;font:14px system-ui;pointer-events:none';
+    d.body.append(hint);
+    f.addEventListener('load', () => hint.remove(), { once: true });
+
+    // Pause the page player: only one live stream / one audio source stays active.
+    const before = video ? { paused: video.paused, muted: video.muted, volume: video.volume } : null;
+    if (video) { try { video.muted = true; video.pause(); } catch (_) { /* ignore */ } }
+    pipState = { win, video, before };
+
+    try { win.resizeTo(width, height + (win.outerHeight - win.innerHeight)); } catch (_) { /* Chrome bug */ }
+    win.addEventListener('pagehide', onIframePipClosed, { once: true });
+    d.addEventListener('keydown', (e) => { if (e.key === 'Escape') win.close(); });
+    console.info(TAG, 'iframe PiP mounted', src, vstat(video));
+  }
+
+  function onIframePipClosed() {
+    const st = pipState; pipState = null; pipWin = null; pipKind = null;
+    if (!st) return;
+    const { video, before } = st;
+    if (video && before) {
+      try { video.muted = before.muted; video.volume = before.volume; } catch (_) { /* ignore */ }
+      if (!before.paused) {
+        try { const p = video.play(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* ignore */ }
+      }
+    }
+    console.info(TAG, 'iframe PiP closed; page player restored');
   }
 
   function makePlaceholder(player) {
@@ -200,10 +372,10 @@
     return ph;
   }
 
-  // ---- Doc PiP (top frame / browsers that allow it): move whole player (0.1.4 behavior)
+  // ---- Doc PiP opened by the top document itself: move the whole player (media stays alive)
   function movePlayerIntoPip(player, video, width, height) {
     console.info(TAG, 'pip opened');
-    try { pipWin.resizeTo(width, height + (pipWin.outerHeight - pipWin.innerHeight)); } catch {}
+    try { pipWin.resizeTo(width, height + (pipWin.outerHeight - pipWin.innerHeight)); } catch (_) { /* ignore */ }
     const d = pipWin.document;
     d.title = document.title;
     const nSheets = copyStyles(document, d);
@@ -223,14 +395,19 @@
       console.info(TAG, 'player moved into PiP', { sheets: nSheets, video: vstat(video) });
     } catch (e) { console.error(TAG, 'moving #live-player into PiP failed', e); }
     video?.play?.().catch(() => {});
-    try { pipWin.dispatchEvent(new Event('resize')); } catch {}
+    try { pipWin.dispatchEvent(new Event('resize')); } catch (_) { /* ignore */ }
     setTimeout(() => console.info(TAG, 'post-move check', vstat(player.querySelector('video'))), 1500);
     d.addEventListener('keydown', (e) => { if (e.key === 'Escape') pipWin.close(); });
     pipWin.addEventListener('pagehide', moveBack, { once: true });
   }
 
-  // ---- In-page float window (iframe rooms): same document, so video never reloads
+  // ---- Last resort: in-page float (same document). Only used when Doc PiP is impossible.
   function openFloat(player, video, width, height) {
+    const availW = Math.max(240, document.documentElement.clientWidth - 48);
+    const availH = Math.max(160, document.documentElement.clientHeight - 72);
+    width = Math.min(width, availW);
+    height = Math.min(height, availH);
+
     const ph = makePlaceholder(player);
     floatState = { player, ph, parent: player.parentNode, next: player.nextSibling, style: player.getAttribute('style') };
     player.parentNode.insertBefore(ph, player);
@@ -258,9 +435,13 @@
       if (e.target.closest('button')) return;
       const sx = e.clientX, sy = e.clientY, r = win.getBoundingClientRect();
       bar.setPointerCapture(e.pointerId);
-      const mv = (ev) => { win.style.left = Math.max(0, r.left + ev.clientX - sx) + 'px'; win.style.top = Math.max(0, r.top + ev.clientY - sy) + 'px'; };
+      const mv = (ev) => {
+        win.style.left = Math.max(0, r.left + ev.clientX - sx) + 'px';
+        win.style.top = Math.max(0, r.top + ev.clientY - sy) + 'px';
+      };
       const up = () => { bar.removeEventListener('pointermove', mv); bar.removeEventListener('pointerup', up); };
-      bar.addEventListener('pointermove', mv); bar.addEventListener('pointerup', up);
+      bar.addEventListener('pointermove', mv);
+      bar.addEventListener('pointerup', up);
     });
     // let the player relayout when the float is resized
     floatState.ro = new ResizeObserver(() => window.dispatchEvent(new Event('resize')));
@@ -299,8 +480,14 @@
       player.querySelector('video')?.play?.().catch(() => {});
       console.info(TAG, 'player moved back', info(player));
     }
-    restore = null; pipWin = null;
+    restore = null;
+    pipWin = null;
+    pipKind = null;
   }
 
-  window.addEventListener('pagehide', () => { if (pipWin) pipWin.close(); moveBack(); closeFloat(); });
+  window.addEventListener('pagehide', () => {
+    if (pipWin) pipWin.close();
+    moveBack();
+    closeFloat();
+  });
 })();
