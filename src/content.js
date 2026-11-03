@@ -857,8 +857,8 @@
     const roomid = await resolveRoomId(data);
     const uid = await fetchUid();
     if (state.phase !== 'active' && state.phase !== 'opening') return;
-    const buvid = readCookie('buvid3');
-    logInfo('danmaku ws connect', { url, roomid, uid, buvid: !!buvid });
+    const buvid = readBuvid();
+    logInfo('danmaku ws connect', { url, roomid, uid, buvid: !!buvid, token: !!token, hosts: hosts.length });
     connectDanmakuWs(url, { uid, roomid, protover: 2, platform: 'web', type: 2, key: token, buvid, clientver: '1.14.3' });
   }
 
@@ -901,6 +901,13 @@
     } catch (_) { return ''; }
   }
 
+  function readBuvid() {
+    let v = readCookie('buvid3');
+    if (!v) { try { v = localStorage.getItem('buvid3') || ''; } catch (_) { /* ignore */ } }
+    if (!v) { try { v = sessionStorage.getItem('buvid3') || ''; } catch (_) { /* ignore */ } }
+    return v;
+  }
+
   function sendPacket(ws, op, body, ver) {
     const head = 16;
     const buf = new ArrayBuffer(head + body.byteLength);
@@ -939,12 +946,12 @@
     };
     ws.onmessage = (ev) => parseWsPayload(ev.data);
     ws.onerror = () => logWarn('danmaku ws error');
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       if (hb) { try { clearInterval(hb); } catch (_) { /* ignore */ } }
       if (state.phase !== 'active' && state.phase !== 'opening') return;
       const n = (state.wsRetry || 0) + 1;
       state.wsRetry = n;
-      logWarn('danmaku ws closed; retry', n);
+      logWarn('danmaku ws closed; retry', n, ev && ev.code, ev && ev.reason);
       if (n <= 3) {
         const id = setTimeout(() => connectDanmakuWs(url, auth), 3000);
         state.timers.push(id);

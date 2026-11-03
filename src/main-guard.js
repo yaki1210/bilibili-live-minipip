@@ -131,7 +131,7 @@
       } catch (e) {
         console.warn('[bmp] __danmuInfo not cloneable', e && e.name);
       }
-    } else if (tries > 40) {
+    } else if (tries > 120) {
       clearInterval(timer);
     }
   }, 500);
