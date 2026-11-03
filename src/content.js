@@ -405,6 +405,7 @@
         'padding:6px 8px;border-radius:4px}',
       '.bmp-controls button:hover{background:rgba(255,255,255,.15)}',
       '.bmp-controls input[type=range]{width:80px;accent-color:#00aeec}',
+      '.bmp-status{font:11px system-ui;color:#aaa;margin-left:auto;white-space:nowrap}',
       '.bmp-toast{position:absolute;left:50%;top:14px;transform:translateX(-50%);z-index:5;' +
         'padding:8px 14px;border-radius:6px;background:rgba(0,0,0,.75);color:#fff;font:13px system-ui;' +
         'display:none;pointer-events:none}',
@@ -451,10 +452,13 @@
     vol.step = '0.01';
     vol.value = '1';
     vol.setAttribute('aria-label', '音量');
-    bar.append(playBtn, muteBtn, vol, dmBtn, closeBtn);
+    const status = d.createElement('span');
+    status.className = 'bmp-status';
+    status.textContent = '弹幕：—';
+    bar.append(status, playBtn, muteBtn, vol, dmBtn, closeBtn);
     d.body.append(bar);
 
-    state.ui = { bar, playBtn, muteBtn, dmBtn, center, layer, needsUnmute: false };
+    state.ui = { bar, playBtn, muteBtn, dmBtn, center, layer, status, lastStatus: '', needsUnmute: false };
     state.renderer = new DanmakuRenderer(d, layer);
 
     centerBtn.addEventListener('click', () => {
@@ -811,18 +815,32 @@
   }
 
   async function startDanmuSource() {
+    setDmStatus('弹幕：连接中…');
     const info = await waitDanmuInfo(4000);
     if (state.phase !== 'active' && state.phase !== 'opening') return;
     if (info) { startOwnWs(info); return; }
+    const nav = await fetchNav();
     const roomid = await resolveRoomId(null);
     if (state.phase !== 'active' && state.phase !== 'opening') return;
+    let apiInfo = null;
     if (roomid) {
-      const apiInfo = await fetchDanmuInfo(roomid);
-      if (state.phase !== 'active' && state.phase !== 'opening') return;
-      if (apiInfo) { startOwnWs(apiInfo); return; }
+      apiInfo = await fetchDanmuInfo(roomid);
+      if (!apiInfo) apiInfo = await fetchDanmuInfoWbi(roomid, nav);
     }
+    if (state.phase !== 'active' && state.phase !== 'opening') return;
+    if (apiInfo) { startOwnWs(apiInfo); return; }
     if (wsAvailable()) { startWsDanmaku(); return; }
     startDomDanmaku();
+  }
+
+  function setDmStatus(text) {
+    if (state.ui) {
+      if (state.ui.status) state.ui.status.textContent = text;
+      if (state.ui.lastStatus === text) return;
+      state.ui.lastStatus = text;
+    }
+    logInfo('danmaku status:', text);
+    toastPip(text);
   }
 
   async function fetchDanmuInfo(roomid) {
@@ -887,11 +905,99 @@
     return short;
   }
 
-  async function fetchUid() {
+  let navCache = null;
+  async function fetchNav() {
+    if (navCache) return navCache;
     try {
       const r = await fetch('https://api.bilibili.com/x/web-interface/nav', { credentials: 'include' }).then((x) => x.json());
-      return r && r.data && r.data.mid ? r.data.mid : 0;
-    } catch (_) { return 0; }
+      navCache = r && r.data ? r.data : null;
+    } catch (e) {
+      logWarn('nav failed', e.name, e.message);
+      navCache = null;
+    }
+    return navCache;
+  }
+
+  async function fetchUid() {
+    const nav = await fetchNav();
+    return nav && nav.mid ? nav.mid : 0;
+  }
+
+  // Minimal MD5 (UTF-8) for the WBI signature; no dependencies.
+  function md5(str) {
+    const utf8 = new TextEncoder().encode(str);
+    const len = utf8.length;
+    const bitLen = len * 8;
+    const total = (((len + 8) >> 6) + 1) * 64;
+    const padded = new Uint8Array(total);
+    padded.set(utf8);
+    padded[len] = 0x80;
+    const dv = new DataView(padded.buffer);
+    dv.setUint32(total - 8, bitLen >>> 0, true);
+    dv.setUint32(total - 4, Math.floor(bitLen / 0x100000000) >>> 0, true);
+
+    let a0 = 0x67452301, b0 = 0xEFCDAB89, c0 = 0x98BADCFE, d0 = 0x10325476;
+    const S = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+      5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+      4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+      6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+    const K = [];
+    for (let i = 0; i < 64; i++) K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) | 0;
+
+    for (let off = 0; off < total; off += 64) {
+      const M = [];
+      for (let i = 0; i < 16; i++) M[i] = dv.getUint32(off + i * 4, true);
+      let A = a0, B = b0, C = c0, D = d0;
+      for (let i = 0; i < 64; i++) {
+        let F, g;
+        if (i < 16) { F = (B & C) | (~B & D); g = i; }
+        else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) % 16; }
+        else if (i < 48) { F = B ^ C ^ D; g = (3 * i + 5) % 16; }
+        else { F = C ^ (B | ~D); g = (7 * i) % 16; }
+        F = (F + A + K[i] + M[g]) | 0;
+        A = D;
+        D = C;
+        C = B;
+        B = (B + ((F << S[i]) | (F >>> (32 - S[i])))) | 0;
+      }
+      a0 = (a0 + A) | 0;
+      b0 = (b0 + B) | 0;
+      c0 = (c0 + C) | 0;
+      d0 = (d0 + D) | 0;
+    }
+    const out = new DataView(new ArrayBuffer(16));
+    out.setInt32(0, a0, true);
+    out.setInt32(4, b0, true);
+    out.setInt32(8, c0, true);
+    out.setInt32(12, d0, true);
+    let hex = '';
+    for (let i = 0; i < 16; i++) hex += out.getUint8(i).toString(16).padStart(2, '0');
+    return hex;
+  }
+
+  async function fetchDanmuInfoWbi(roomid, nav) {
+    try {
+      if (!nav || !nav.wbi_img || !nav.wbi_img.img_url || !nav.wbi_img.sub_url) return null;
+      const keyOf = (u) => String(u).split('/').pop().split('.')[0];
+      const raw = keyOf(nav.wbi_img.img_url) + keyOf(nav.wbi_img.sub_url);
+      const TAB = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+        33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17,
+        0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52];
+      const mixin = TAB.map((i) => raw[i] || '').join('').slice(0, 32);
+      const params = { id: String(roomid), type: '0', wts: String(Math.floor(Date.now() / 1000)) };
+      const query = Object.keys(params).sort().map((k) => {
+        const v = String(params[k]).replace(/[!'()*]/g, '');
+        return encodeURIComponent(k) + '=' + encodeURIComponent(v);
+      }).join('&');
+      const url = 'https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?' +
+        query + '&w_rid=' + md5(query + mixin);
+      const r = await fetch(url, { credentials: 'include' }).then((x) => x.json());
+      if (r && r.data && r.data.token && r.data.host_list && r.data.host_list.length) return r;
+      logWarn('getDanmuInfo(WBI) refused', r && r.code, r && r.message);
+    } catch (e) {
+      logWarn('getDanmuInfo(WBI) failed', e.name, e.message);
+    }
+    return null;
   }
 
   function readCookie(name) {
@@ -940,6 +1046,7 @@
         }, 30000);
         state.timers.push(hb);
         logInfo('danmaku ws open', url);
+        setDmStatus('弹幕：WebSocket');
       } catch (e) {
         logWarn('danmaku ws auth failed', e.name, e.message);
       }
@@ -952,6 +1059,7 @@
       const n = (state.wsRetry || 0) + 1;
       state.wsRetry = n;
       logWarn('danmaku ws closed; retry', n, ev && ev.code, ev && ev.reason);
+      setDmStatus('弹幕：断开重试 ' + n);
       if (n <= 3) {
         const id = setTimeout(() => connectDanmakuWs(url, auth), 3000);
         state.timers.push(id);
@@ -990,6 +1098,7 @@
       } catch (_) { /* cross-origin */ }
     }
     logInfo('danmaku source ws (page socket tap)');
+    setDmStatus('弹幕：页面 Socket');
   }
 
   let wsWarned = false;
@@ -1066,6 +1175,7 @@
   }
 
   function startDomDanmaku() {
+    setDmStatus('弹幕：DOM（最小化会停）');
     let tries = 0;
     const attempt = () => {
       if (state.phase !== 'active' && state.phase !== 'opening') return;
