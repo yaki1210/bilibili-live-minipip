@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Bilibili Live 弹幕小窗 (M1)",
+  "version": "0.1.6",
+  "description": "接管直播页原生「小窗模式」按钮，用 Document Picture-in-Picture 打开自建小窗。",
+  "minimum_chrome_version": "116",
+  "content_scripts": [
+    {
+      "matches": ["*://live.bilibili.com/*"],
+      "js": ["src/main-guard.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": ["*://live.bilibili.com/*"],
+      "js": ["src/content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ]
+}
