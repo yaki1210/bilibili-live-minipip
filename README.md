@@ -1,128 +1,61 @@
-# bilibili-live-minipip (M2) — 0.2.8
+# Bilibili Live 弹幕小窗
 
-Chrome MV3 extension: the live player's native **小窗模式** button opens a real, always-on-top
-mini window with the live picture and live danmaku. The page player keeps playing; no page is
-reloaded and no second stream is pulled.
+Chrome / Edge 扩展。接管 B 站直播页播放器上的「小窗模式」，打开一个真正置顶的小窗：里面是当前直播画面，以及继续滚动的实时弹幕。页面不刷新，也不另拉一路直播流。
 
-## What it does
+离开直播标签页之后，弹幕连接挂在小窗自己的 WebSocket 和计时器上。小窗还开着，弹幕就会继续更新。
 
-- **Top-document rooms**: moves the whole `#live-player` node into a Document Picture-in-Picture
-  window (same document, so the media element keeps playing). Danmaku and player controls come
-  along. On close the player moves back.
-- **Same-origin iframe rooms**: opens Document PiP from the top document, then mirrors the playing
-  `<video>` with `captureStream()` into a PiP `<video>`, and draws danmaku in a DOM layer inside
-  the PiP window. The page keeps playing; page audio is muted with a WebAudio gain, PiP audio comes
-  from a `MediaStreamDestination`.
-- **Fallback**: if Document PiP or `captureStream()` is unavailable, it opens the native
-  `video.requestPictureInPicture()` window (no danmaku).
+当前版本 **0.2.8**。需要 Chrome 或 Edge **116** 及以上。
 
-## Load unpacked
+## 功能
 
-1. Chrome/Edge >= 116 -> `chrome://extensions` -> enable *Developer mode*.
-2. *Load unpacked* -> select this folder (the one with `manifest.json`).
-3. Open `https://live.bilibili.com/<room>`, hover the player -> click 小窗模式.
-4. Close the mini window (关闭 / Esc / window close) -> page audio returns, player keeps running.
-5. Filter the DevTools console by `[bmp]` for logs.
+- 播放器在顶层页面时，把整个 `#live-player` 移进 Document Picture-in-Picture 窗口。画面、控件一起过去，关闭小窗后播放器回到原页面，直播继续播。
+- 播放器在同源 iframe 里时，小窗用 `captureStream()` 镜像正在播放的画面，并在小窗里单独画弹幕。原页面继续播放。
+- 浏览器不支持 Document PiP，或无法采集画面时，退回系统画中画。这种情况下只有画面。
+- 弹幕 token 优先用直播页自己已经拿到的结果。页面没有给出结果时，扩展在页面环境里对 `getDanmuInfo` 做 WBI 签名（带 `web_location`），避免接口返回 `-352`。
+- 小窗右上角显示连接状态和收到的数据包数量。
 
-## Notes (0.2.8)
+## 安装
 
-- The mini window's CSP blocks inline scripts, so the danmaku client is no longer injected
-  as a `<script>`. The same client runs from the content script, but its WebSocket, heartbeat
-  and animation timers are created with the mini window's own constructors.
+1. 打开 `chrome://extensions` 或 `edge://extensions`，打开「开发人员模式」。
+2. 选择「加载解压缩的扩展」，选中含有 `manifest.json` 的这个文件夹。
+3. 打开任意直播间 `https://live.bilibili.com/<房间号>`，鼠标移到播放器上，点击「小窗模式」。
+4. 关闭小窗（关闭按钮、Esc，或直接关窗口）后，页面声音回来，直播继续播放。
 
-## Notes (0.2.7)
+更新代码后，在扩展管理页对该扩展点一次「重新加载」。
 
-- **Danmaku keeps running after leaving the live tab.** The socket, heartbeat, decode, and
-  drawing run inside the mini window. The live tab is frozen in the background, so Bilibili's
-  own danmaku and any callback that lives in that tab stop. The mini window stays visible, so
-  its connection does not.
-- On rooms where the whole player is moved into the mini window, Bilibili's danmaku layer is
-  hidden once this connection is up, so comments are not drawn twice.
+## 状态
 
-## Notes (0.2.6)
+小窗右上角会显示当前弹幕来源：
 
-- **getDanmuInfo -352**: the unsigned `id` + `type` request is gone. The extension reuses the
-  page's own signed response. If that is missing, it signs `id`, `type`, `web_location=444.8`
-  and `wts` in the page world (so Referer and `buvid3` are the page's) and retries once after
-  `finger/spi` when the cookie is empty.
-- The page danmaku socket is only observed. Its auth packet is no longer rewritten to protover 2.
+| 状态 | 含义 |
+| --- | --- |
+| `弹幕：连接中…` | 正在获取 token 或建立连接 |
+| `弹幕：WebSocket · N` | 已连上弹幕服务器，N 是收到的数据包数量 |
+| `弹幕：断开重试 N` | 连接断开，正在换线路重连 |
+| `弹幕：DOM（最小化会停）` | 没能连上弹幕服务器，改为读取页面聊天列表。切走直播页后，这条来源会停 |
 
-## Notes (0.2.5)
+在直播页开发者工具里过滤 `[bmp]` 可以看连接日志。日志不包含 token。
 
-- **Socket lives in the PiP window**: the danmaku WebSocket and its heartbeat are created via
-  `pipWin.WebSocket` / `pipWin.setInterval`, so they keep running while the live tab is in the
-  background or the browser is minimized. The PiP window stays visible, so its timers are not
-  throttled the way the page tab's are.
-- **Always-visible badge**: the PiP window shows `弹幕：WebSocket · N` in the top-right corner
-  (N = received messages), so the current source and liveness are visible without DevTools.
+## 限制
 
-## Notes (0.2.4)
+- 只支持 Chromium 系浏览器（Chrome、Edge）116 及以上。
+- 只处理 `live.bilibili.com` 的直播页。
+- 小窗里不能发送弹幕，也不渲染礼物、上舰和 SC 特效。
+- 系统画中画兜底只有视频画面。
+- 未登录时，个别房间的弹幕文本可能被接口打码。
+- B 站改版后，播放器或「小窗模式」按钮的选择器可能失效。
 
-- **WBI fallback**: if `window.__danmuInfo` is missing or the unsigned `getDanmuInfo` is refused,
-  the extension signs `getDanmuInfo` with WBI (built-in MD5, no dependencies) and uses that token.
-- **Visible danmaku status**: the PiP control bar shows the current source
-  (`弹幕：WebSocket` / `弹幕：DOM（最小化会停）` / `弹幕：断开重试 N`), and the same text appears as a
-  toast. Hover the PiP window to see it.
+## 文件
 
-## Notes (0.2.3)
+- `manifest.json`：MV3。两个内容脚本都注入 `*://live.bilibili.com/*`，包含所有 frame。
+- `src/main-guard.js`：运行在页面主世界。转发官方小窗请求，观察页面弹幕连接（不改认证包），接住页面自己的 `getDanmuInfo`，并代扩展在页面环境里请求导航信息、签名接口和 buvid。
+- `src/content.js`：接管「小窗模式」按钮，打开小窗，移动或镜像播放器，连接弹幕并绘制。
 
-- Diagnostics: `danmaku ws closed` now logs the close code/reason; `danmaku ws connect` logs
-  room/user/host counts without the token; `__danmuInfo` polling lasts 60s. `buvid3` also falls
-  back to localStorage/sessionStorage.
+## 版本
 
-## Notes (0.2.2)
+- **0.2.8**：小窗页面禁止内联脚本。弹幕客户端留在扩展里，WebSocket、心跳和绘制使用小窗自己的构造函数，离开直播页后继续收弹幕。
+- **0.2.6**：`getDanmuInfo` 改为复用页面结果；否则在页面环境里做 WBI 签名。不再改写页面弹幕连接的认证包。
+- **0.2.2**：自己连接弹幕 WebSocket（zlib），不再只靠页面聊天列表。
+- **0.2.0**：真正的顶层小窗。播放器在顶层时整段移入；在 iframe 里时镜像画面。
 
-- **Own danmaku socket**: 0.2.1 patched the page's WebSocket, but that missed the real connection
-  in some rooms. 0.2.2 reads the page's `window.__danmuInfo` (main-guard posts it over), falls back
-  to `getDanmuInfo` if needed, and opens its own `wss://<host>:<port>/sub` socket with
-  `protover 2` (zlib), heartbeat, and auto-reconnect. This socket lives in the content script and
-  keeps receiving while the browser is minimized; frames are rendered into the PiP window.
-- Order of danmaku sources: own socket -> page socket tap (0.2.1) -> DOM observer (last resort).
-- Console markers: `[bmp] __danmuInfo captured`, `[bmp] danmaku ws connect`,
-  `[bmp] danmaku ws open`. If it closes, `danmaku ws closed; retry` up to 3 times, then the DOM
-  fallback (which stops when minimized).
-
-## Notes (0.2.1)
-
-- **Minimized browser / hidden tab**: the old danmaku source was the page DOM, and Bilibili stops
-  updating the chat DOM when the tab is hidden. 0.2.1 taps the page's own danmaku WebSocket in the
-  MAIN world (`src/main-guard.js`), switches the auth packet to `protover 2` (zlib) and forwards
-  every frame to the content script, which inflates it with the native `DecompressionStream` and
-  renders into the PiP window. The PiP window stays visible while the browser is minimized, so
-  danmaku keeps scrolling. The DOM observer remains only as a fallback when no socket is tapped.
-- If the server ignores protover 2 and keeps sending brotli (`ver 3`), the console shows
-  `[bmp] ws brotli frame` and danmaku falls back to the DOM source (which stops when minimized).
-
-## Notes (0.2.0)
-
-- Document PiP must be requested from the **top-level** document. In iframe rooms the content
-  script calls `window.top.documentPictureInPicture.requestWindow()` synchronously inside the
-  click handler so the user gesture is preserved.
-- Moving a playing `<video>` across documents destroys its media element, so iframe rooms use a
-  stream mirror instead of moving the player. The mirror is the same decoded stream, not a reload.
-- Danmaku source: the top document's chat list `#chat-items .chat-item.danmaku-item` first, then
-  the player overlay `.web-player-danmaku .danmaku-item-container`. Gift / guard / system / SC
-  messages are filtered out. Emotes from `*.hdslb.com` are shown as images.
-- Watermark: the mirrored PiP video is the page video stream; the page itself stays visible.
-- If the page is in a background tab, `captureStream()` keeps producing frames because the source
-  video keeps playing (the PiP window consumes the stream). Danmaku from the chat DOM may stop if
-  Bilibili throttles chat updates in background tabs; a WebSocket danmaku source is the next step.
-- Audio: `video.muted = true` would also mute `captureStream()` audio, so the page is silenced with
-  `AudioContext` gain 0 and the PiP gets a `MediaStreamDestination` track. If Bilibili already owns
-  the element's WebAudio graph, the mirror and danmaku still work and the page keeps its sound.
-- Native Video PiP fallback has no danmaku (the browser only renders the `<video>`).
-
-## Files
-
-- `manifest.json` — MV3, two content scripts on `*://live.bilibili.com/*` (`all_frames`).
-- `src/main-guard.js` — MAIN world, `document_start`: wraps the page's own
-  `documentPictureInPicture.requestWindow`, forwards it to the content script synchronously, and
-  lets it through when our request sets `data-bmp-self`.
-- `src/content.js` — button hijack (Path A official call / Path B DOM click), Document PiP open,
-  top-document player move, iframe mirror (`captureStream` + WebAudio), PiP danmaku renderer,
-  control bar, and cleanup.
-
-## Version history
-
-- 0.1.x: move the player / in-page float / iframe page copy experiments.
-- 0.2.0: real top-level mini window; mirror instead of reloading a page; live danmaku in the PiP.
+更早的改动在 git 历史里。
