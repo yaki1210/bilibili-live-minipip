@@ -1,4 +1,4 @@
-# bilibili-live-minipip (M2) — 0.2.5
+# bilibili-live-minipip (M2) — 0.2.8
 
 Chrome MV3 extension: the live player's native **小窗模式** button opens a real, always-on-top
 mini window with the live picture and live danmaku. The page player keeps playing; no page is
@@ -23,6 +23,29 @@ reloaded and no second stream is pulled.
 3. Open `https://live.bilibili.com/<room>`, hover the player -> click 小窗模式.
 4. Close the mini window (关闭 / Esc / window close) -> page audio returns, player keeps running.
 5. Filter the DevTools console by `[bmp]` for logs.
+
+## Notes (0.2.8)
+
+- The mini window's CSP blocks inline scripts, so the danmaku client is no longer injected
+  as a `<script>`. The same client runs from the content script, but its WebSocket, heartbeat
+  and animation timers are created with the mini window's own constructors.
+
+## Notes (0.2.7)
+
+- **Danmaku keeps running after leaving the live tab.** The socket, heartbeat, decode, and
+  drawing run inside the mini window. The live tab is frozen in the background, so Bilibili's
+  own danmaku and any callback that lives in that tab stop. The mini window stays visible, so
+  its connection does not.
+- On rooms where the whole player is moved into the mini window, Bilibili's danmaku layer is
+  hidden once this connection is up, so comments are not drawn twice.
+
+## Notes (0.2.6)
+
+- **getDanmuInfo -352**: the unsigned `id` + `type` request is gone. The extension reuses the
+  page's own signed response. If that is missing, it signs `id`, `type`, `web_location=444.8`
+  and `wts` in the page world (so Referer and `buvid3` are the page's) and retries once after
+  `finger/spi` when the cookie is empty.
+- The page danmaku socket is only observed. Its auth packet is no longer rewritten to protover 2.
 
 ## Notes (0.2.5)
 

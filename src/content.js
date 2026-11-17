@@ -36,18 +36,51 @@
   const logErr = (...a) => console.error(TAG, ...a);
   const vstat = (v) => v && ({ paused: v.paused, ready: v.readyState, w: v.videoWidth, h: v.videoHeight });
 
-  // Danmaku server config from the page (posted by main-guard from window.__danmuInfo).
+  // Danmaku server config from the page (posted by main-guard from window.__danmuInfo
+  // or from the page's own getDanmuInfo response).
   let danmuInfo = null;
-  function onDanmuInfo(ev) {
+  let fetchSeq = 0;
+  const fetchPending = new Map();
+  function onMainMessage(ev) {
     const d = ev.data;
-    if (d && d.__bmpDanmuInfo && d.info) {
+    if (!d) return;
+    if (d.__bmpFetchResult && ev.currentTarget === window && fetchPending.has(d.id)) {
+      const pending = fetchPending.get(d.id);
+      fetchPending.delete(d.id);
+      if (d.error) pending.reject(new Error(d.error));
+      else pending.resolve(d.json);
+      return;
+    }
+    if (d.__bmpDanmuInfo && d.info) {
       danmuInfo = d.info;
       logInfo('danmu info received');
     }
   }
-  window.addEventListener('message', onDanmuInfo);
+  window.addEventListener('message', onMainMessage);
   if (!isTopFrame) {
-    try { window.top.addEventListener('message', onDanmuInfo); } catch (_) { /* cross-origin */ }
+    try { window.top.addEventListener('message', onMainMessage); } catch (_) { /* cross-origin */ }
+  }
+
+  // Fetch from the page world so the request carries the live page's cookies.
+  // getDanmuInfo without a WBI signature returns -352.
+  function pageFetch(url) {
+    const id = ++fetchSeq;
+    const bridged = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!fetchPending.has(id)) return;
+        fetchPending.delete(id);
+        reject(new Error('page fetch timeout'));
+      }, 8000);
+      fetchPending.set(id, {
+        resolve: (value) => { clearTimeout(timer); resolve(value); },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      });
+      window.postMessage({ __bmpFetch: true, id, url }, '*');
+    });
+    return bridged.catch((error) => {
+      logWarn('page fetch fallback', error.message);
+      return fetch(url, { credentials: 'include' }).then((res) => res.json());
+    });
   }
 
   // ---------- window helpers ----------
@@ -424,6 +457,7 @@
     state.pipVideo = video;
 
     const layer = d.createElement('div');
+    layer.id = 'bmp-dm-layer';
     layer.className = 'bmp-danmaku';
     d.body.append(layer);
 
@@ -462,6 +496,7 @@
     d.body.append(bar);
 
     const badge = d.createElement('div');
+    badge.id = 'bmp-dm-badge';
     badge.className = 'bmp-badge';
     badge.textContent = '弹幕：—';
     d.body.append(badge);
@@ -495,9 +530,8 @@
         muteBtn.textContent = v.muted ? '取消静音' : '静音';
         vol.value = v.muted ? '0' : String(v.volume);
       } else if (act === 'dm') {
-        if (!state.renderer) return;
-        const on = !state.renderer.enabled;
-        state.renderer.setEnabled(on);
+        const on = !(state.renderer && state.renderer.enabled);
+        syncDanmakuEnabled(on);
         dmBtn.textContent = on ? '弹幕开' : '弹幕关';
       } else if (act === 'close') {
         cleanup('close-button');
@@ -549,11 +583,9 @@
         const v = state.pipVideo;
         if (v) { v.muted = !v.muted; muteBtn.textContent = v.muted ? '取消静音' : '静音'; }
       } else if (e.key === 'd' || e.key === 'D') {
-        if (state.renderer) {
-          const on = !state.renderer.enabled;
-          state.renderer.setEnabled(on);
-          dmBtn.textContent = on ? '弹幕开' : '弹幕关';
-        }
+        const on = !(state.renderer && state.renderer.enabled);
+        syncDanmakuEnabled(on);
+        dmBtn.textContent = on ? '弹幕开' : '弹幕关';
       }
     });
 
@@ -591,8 +623,37 @@
     try { const p = video.play(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* ignore */ }
     try { win.dispatchEvent(new Event('resize')); } catch (_) { /* ignore */ }
     d.addEventListener('keydown', (e) => { if (e.key === 'Escape') cleanup('escape'); });
+    mountMoveDanmaku(win);
     state.phase = 'active';
+    startDanmaku();
     logInfo('move active', { w: size.width, h: size.height, video: vstat(video) });
+  }
+
+  function mountMoveDanmaku(win) {
+    const d = win.document;
+    if (d.getElementById('bmp-dm-style')) return;
+    const st = d.createElement('style');
+    st.id = 'bmp-dm-style';
+    st.textContent = [
+      '.bmp-danmaku{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:6;' +
+        'font-family:"Microsoft YaHei",system-ui,sans-serif;font-weight:600;' +
+        'text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000}',
+      '.bmp-dm{position:absolute;left:100%;white-space:nowrap;line-height:1.35;will-change:transform}',
+      '.bmp-badge{position:absolute;top:6px;right:8px;z-index:7;font:11px system-ui;' +
+        'color:rgba(255,255,255,.75);background:rgba(0,0,0,.45);padding:2px 6px;border-radius:4px;' +
+        'pointer-events:none;white-space:nowrap}',
+      'html.bmp-dm-live .web-player-danmaku, html.bmp-dm-live .danmaku-item-container{visibility:hidden!important}',
+    ].join('');
+    (d.head || d.documentElement).append(st);
+    const layer = d.createElement('div');
+    layer.id = 'bmp-dm-layer';
+    layer.className = 'bmp-danmaku';
+    d.body.append(layer);
+    const badge = d.createElement('div');
+    badge.id = 'bmp-dm-badge';
+    badge.className = 'bmp-badge';
+    badge.textContent = '弹幕：连接中…';
+    d.body.append(badge);
   }
 
   function updatePlayBtn(playing) {
@@ -831,10 +892,7 @@
     const roomid = await resolveRoomId(null);
     if (state.phase !== 'active' && state.phase !== 'opening') return;
     let apiInfo = null;
-    if (roomid) {
-      apiInfo = await fetchDanmuInfo(roomid);
-      if (!apiInfo) apiInfo = await fetchDanmuInfoWbi(roomid, nav);
-    }
+    if (roomid) apiInfo = await fetchDanmuInfo(roomid, nav);
     if (state.phase !== 'active' && state.phase !== 'opening') return;
     if (apiInfo) { startOwnWs(apiInfo); return; }
     if (wsAvailable()) { startWsDanmaku(); return; }
@@ -853,13 +911,8 @@
     toastPip(text);
   }
 
-  async function fetchDanmuInfo(roomid) {
-    try {
-      const r = await fetch('https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?id=' + roomid + '&type=0', { credentials: 'include' }).then((x) => x.json());
-      if (r && r.data && r.data.token && r.data.host_list && r.data.host_list.length) return r;
-      logWarn('getDanmuInfo refused', r && r.code, r && r.message);
-    } catch (e) { logWarn('getDanmuInfo failed', e.name, e.message); }
-    return null;
+  function danmuPayload(r) {
+    return r && r.data && r.data.token && r.data.host_list && r.data.host_list.length ? r : null;
   }
 
   function waitDanmuInfo(ms) {
@@ -878,16 +931,291 @@
   async function startOwnWs(info) {
     const data = (info && info.data) || info || {};
     const token = data.token;
-    const hosts = data.host_list || [];
+    const hosts = (data.host_list || []).filter((h) => h && h.host).map((h) => ({
+      host: h.host,
+      wss_port: h.wss_port || 443,
+    }));
     if (!token || !hosts.length) { fallbackDanmaku(); return; }
-    const h = hosts[0];
-    const url = 'wss://' + h.host + ':' + h.wss_port + '/sub';
     const roomid = await resolveRoomId(data);
     const uid = await fetchUid();
     if (state.phase !== 'active' && state.phase !== 'opening') return;
     const buvid = readBuvid();
-    logInfo('danmaku ws connect', { url, roomid, uid, buvid: !!buvid, token: !!token, hosts: hosts.length });
-    connectDanmakuWs(url, { uid, roomid, protover: 2, platform: 'web', type: 2, key: token, buvid, clientver: '1.14.3' });
+    const auth = { uid, roomid, protover: 2, platform: 'web', type: 2, key: token, buvid, clientver: '1.14.3' };
+    const win = state.pipWin;
+    logInfo('danmaku ws connect', { host: hosts[0].host, roomid, uid, buvid: !!buvid, token: !!token, hosts: hosts.length });
+    if (win && !win.closed) {
+      try {
+        state.pipClient = createPipDanmaku(win);
+        state.pipClient.start({
+          hosts: hosts,
+          auth: auth,
+          enabled: !(state.renderer && state.renderer.enabled === false),
+        });
+        return;
+      } catch (e) {
+        logWarn('pip danmaku client failed', e.name, e.message);
+      }
+    }
+    connectDanmakuWs('wss://' + hosts[0].host + ':' + hosts[0].wss_port + '/sub', auth);
+  }
+
+  function syncDanmakuEnabled(on) {
+    if (state.renderer) state.renderer.setEnabled(on);
+    if (state.pipClient) state.pipClient.setEnabled(on);
+  }
+
+  // Socket, heartbeat and drawing use the PiP window's own constructors and timers.
+  // The live tab is frozen in the background; a visible PiP window is not.
+  // No inline script: the PiP document's CSP blocks it.
+  function createPipDanmaku(win) {
+    const document = win.document;
+    const WebSocket = win.WebSocket;
+    const setInterval = win.setInterval.bind(win);
+    const clearInterval = win.clearInterval.bind(win);
+    const setTimeout = win.setTimeout.bind(win);
+    const requestAnimationFrame = win.requestAnimationFrame.bind(win);
+    const performance = win.performance;
+    const DecompressionStream = win.DecompressionStream || globalThis.DecompressionStream;
+    const Blob = win.Blob;
+    const Response = win.Response;
+    const TextEncoder = win.TextEncoder;
+    const TextDecoder = win.TextDecoder;
+    const ArrayBufferRef = win.ArrayBuffer;
+
+    const st = {
+      ws: null,
+      hb: 0,
+      gen: 0,
+      retry: 0,
+      hosts: [],
+      hostIdx: 0,
+      auth: null,
+      started: false,
+      alive: true,
+      enabled: true,
+      seen: new Set(),
+      queue: [],
+      active: [],
+      tracks: [],
+      font: 18,
+      count: 0,
+    };
+
+    function layer() { return document.getElementById('bmp-dm-layer'); }
+    function setStatus(text) {
+      const line = st.count ? text + ' · ' + st.count : text;
+      const badge = document.getElementById('bmp-dm-badge');
+      const status = document.querySelector('.bmp-status');
+      if (badge) badge.textContent = line;
+      if (status) status.textContent = text;
+      document.documentElement.setAttribute('data-bmp-dm-state', text);
+      document.documentElement.setAttribute('data-bmp-dm-count', String(st.count));
+    }
+
+    function resize() {
+      const el = layer();
+      if (!el) return;
+      const h = document.documentElement.clientHeight || 270;
+      const font = Math.max(12, Math.min(22, Math.round(h / 18)));
+      const lh = Math.round(font * 1.35);
+      const usable = Math.max(lh * 3, h - 64);
+      const count = Math.max(3, Math.min(10, Math.floor(usable / lh)));
+      st.font = font;
+      st.tracks = Array.from({ length: count }, function (_, i) { return { top: 8 + i * lh, freeAt: 0 }; });
+      el.style.fontSize = font + 'px';
+    }
+
+    function paint(item, track, now) {
+      const elLayer = layer();
+      if (!elLayer) return;
+      const node = document.createElement('span');
+      node.className = 'bmp-dm';
+      node.style.top = track.top + 'px';
+      node.style.color = item.color || '#ffffff';
+      node.textContent = item.text;
+      elLayer.append(node);
+      const w = node.offsetWidth || 0;
+      const dist = (elLayer.clientWidth || 480) + w;
+      const speed = 130;
+      const anim = node.animate(
+        [{ transform: 'translateX(0)' }, { transform: 'translateX(-' + dist + 'px)' }],
+        { duration: Math.max(600, Math.round(dist / speed * 1000)), easing: 'linear' }
+      );
+      anim.onfinish = function () { try { node.remove(); } catch (e) { /* ignore */ } };
+      track.freeAt = now + Math.round((w + 28) / speed * 1000);
+      st.active.push(node);
+      if (st.active.length > 80) {
+        const old = st.active.shift();
+        try { old.remove(); } catch (e) { /* ignore */ }
+      }
+    }
+
+    function pump() {
+      if (!st.alive) return;
+      const now = performance.now();
+      if (st.enabled) {
+        let n = 0;
+        while (st.queue.length && n < 2) {
+          const track = st.tracks.find(function (t) { return t.freeAt <= now; });
+          if (!track) break;
+          paint(st.queue.shift(), track, now);
+          n++;
+        }
+      }
+      requestAnimationFrame(pump);
+    }
+
+    function colorOf(raw) {
+      const s = String(raw == null ? '' : raw).trim();
+      if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(s)) return s;
+      if (/^\d+$/.test(s)) return '#' + ((parseInt(s, 10) & 0xffffff) >>> 0).toString(16).padStart(6, '0');
+      return '#ffffff';
+    }
+
+    function remember(item) {
+      if (!item.text) return;
+      const key = item.key;
+      if (st.seen.has(key)) return;
+      st.seen.add(key);
+      if (st.seen.size > 800) st.seen.clear();
+      st.count++;
+      setStatus(document.documentElement.getAttribute('data-bmp-dm-state') || '弹幕：WebSocket');
+      if (!st.enabled) return;
+      st.queue.push(item);
+      if (st.queue.length > 40) st.queue.shift();
+    }
+
+    function sendPacket(ws, op, body) {
+      const head = 16;
+      const buf = new ArrayBuffer(head + body.byteLength);
+      const dv = new DataView(buf);
+      dv.setUint32(0, buf.byteLength);
+      dv.setUint16(4, head);
+      dv.setUint16(6, 1);
+      dv.setUint32(8, op);
+      dv.setUint32(12, 1);
+      new Uint8Array(buf, head).set(body);
+      ws.send(buf);
+    }
+
+    async function inflate(bytes, format) {
+      const ds = new DecompressionStream(format);
+      const stream = new Blob([bytes]).stream().pipeThrough(ds);
+      const ab = await new Response(stream).arrayBuffer();
+      return new Uint8Array(ab);
+    }
+
+    async function parseBuf(buf) {
+      let off = 0;
+      while (off + 16 <= buf.byteLength) {
+        const dv = new DataView(buf, off);
+        const total = dv.getUint32(0);
+        const headLen = dv.getUint16(4);
+        const ver = dv.getUint16(6);
+        const op = dv.getUint32(8);
+        if (total < headLen || off + total > buf.byteLength) break;
+        const body = new Uint8Array(buf, off + headLen, total - headLen);
+        if (ver === 2 || ver === 3) {
+          try {
+            const out = await inflate(body, ver === 3 ? 'brotli' : 'deflate');
+            await parseBuf(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+          } catch (e) {
+            const n = Number(document.documentElement.getAttribute('data-bmp-dm-decode-fail') || 0) + 1;
+            document.documentElement.setAttribute('data-bmp-dm-decode-fail', String(n));
+          }
+        } else if (op === 5) {
+          let obj;
+          try { obj = JSON.parse(new TextDecoder().decode(body)); } catch (e) { obj = null; }
+          if (obj && obj.cmd) document.documentElement.setAttribute('data-bmp-dm-last-cmd', String(obj.cmd).slice(0, 40));
+          if (obj && String(obj.cmd || '').indexOf('DANMU_MSG') === 0 && Array.isArray(obj.info)) {
+            const info = obj.info;
+            const text = String(info[1] || '').trim();
+            const meta = Array.isArray(info[0]) ? info[0] : [];
+            const user = Array.isArray(info[2]) ? info[2] : [];
+            remember({
+              text: text,
+              color: colorOf(meta[3]),
+              key: String(user[0] || '') + '|' + String(meta[4] || '') + '|' + text,
+            });
+          }
+        }
+        off += total;
+      }
+    }
+
+    function shutdown() {
+      st.alive = false;
+      st.gen++;
+      if (st.hb) { clearInterval(st.hb); st.hb = 0; }
+      if (st.ws) { try { st.ws.close(); } catch (e) { /* ignore */ } st.ws = null; }
+    }
+
+    function connect() {
+      const gen = ++st.gen;
+      if (st.hb) { clearInterval(st.hb); st.hb = 0; }
+      if (st.ws) { try { st.ws.close(); } catch (e) { /* ignore */ } st.ws = null; }
+      if (!st.hosts.length) { setStatus('弹幕：无服务器'); return; }
+      const h = st.hosts[st.hostIdx % st.hosts.length];
+      const url = 'wss://' + h.host + ':' + (h.wss_port || 443) + '/sub';
+      let ws;
+      try { ws = new WebSocket(url); } catch (e) { schedule(gen); return; }
+      st.ws = ws;
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = function () {
+        if (gen !== st.gen) return;
+        try { sendPacket(ws, 7, new TextEncoder().encode(JSON.stringify(st.auth || {}))); } catch (e) { /* ignore */ }
+        st.hb = setInterval(function () {
+          try { sendPacket(ws, 2, new Uint8Array(0)); } catch (e) { /* ignore */ }
+        }, 30000);
+        st.retry = 0;
+        document.documentElement.classList.add('bmp-dm-live');
+        setStatus('弹幕：WebSocket');
+      };
+      ws.onmessage = function (ev) {
+        const n = Number(document.documentElement.getAttribute('data-bmp-dm-frames') || 0) + 1;
+        document.documentElement.setAttribute('data-bmp-dm-frames', String(n));
+        const take = function (data) {
+          if (data instanceof ArrayBufferRef) parseBuf(data).catch(function () {});
+        };
+        if (ev.data instanceof Blob) ev.data.arrayBuffer().then(take).catch(function () {});
+        else take(ev.data);
+      };
+      ws.onclose = function () {
+        if (gen !== st.gen || !st.alive) return;
+        if (st.hb) { clearInterval(st.hb); st.hb = 0; }
+        document.documentElement.classList.remove('bmp-dm-live');
+        st.hostIdx++;
+        schedule(gen);
+      };
+      setStatus('弹幕：连接中…');
+    }
+
+    function schedule(gen) {
+      st.retry++;
+      setStatus('弹幕：重连 ' + st.retry);
+      setTimeout(function () {
+        if (gen !== st.gen || !st.alive) return;
+        connect();
+      }, Math.min(30000, 2000 * st.retry));
+    }
+
+    win.addEventListener('resize', resize);
+    resize();
+    requestAnimationFrame(pump);
+
+    return {
+      start: function (cfg) {
+        if (st.started) return;
+        st.hosts = (cfg && cfg.hosts) || [];
+        st.auth = (cfg && cfg.auth) || {};
+        st.enabled = !cfg || cfg.enabled !== false;
+        st.started = true;
+        resize();
+        connect();
+      },
+      stop: shutdown,
+      setEnabled: function (on) { st.enabled = !!on; },
+    };
   }
 
   function fallbackDanmaku() {
@@ -919,7 +1247,7 @@
   async function fetchNav() {
     if (navCache) return navCache;
     try {
-      const r = await fetch('https://api.bilibili.com/x/web-interface/nav', { credentials: 'include' }).then((x) => x.json());
+      const r = await pageFetch('https://api.bilibili.com/x/web-interface/nav');
       navCache = r && r.data ? r.data : null;
     } catch (e) {
       logWarn('nav failed', e.name, e.message);
@@ -985,27 +1313,46 @@
     return hex;
   }
 
-  async function fetchDanmuInfoWbi(roomid, nav) {
+  function signDanmuQuery(roomid, nav) {
+    if (!nav || !nav.wbi_img || !nav.wbi_img.img_url || !nav.wbi_img.sub_url) return '';
+    const keyOf = (u) => String(u).split('/').pop().split('.')[0];
+    const raw = keyOf(nav.wbi_img.img_url) + keyOf(nav.wbi_img.sub_url);
+    const TAB = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+      33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17,
+      0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52];
+    const mixin = TAB.map((i) => raw[i] || '').join('').slice(0, 32);
+    const params = {
+      id: String(roomid),
+      type: '0',
+      web_location: '444.8',
+      wts: String(Math.floor(Date.now() / 1000)),
+    };
+    const query = Object.keys(params).sort().map((k) => {
+      const v = String(params[k]).replace(/[!'()*]/g, '');
+      return encodeURIComponent(k) + '=' + encodeURIComponent(v);
+    }).join('&');
+    return query + '&w_rid=' + md5(query + mixin);
+  }
+
+  async function fetchDanmuInfo(roomid, nav, triedBuvid) {
     try {
-      if (!nav || !nav.wbi_img || !nav.wbi_img.img_url || !nav.wbi_img.sub_url) return null;
-      const keyOf = (u) => String(u).split('/').pop().split('.')[0];
-      const raw = keyOf(nav.wbi_img.img_url) + keyOf(nav.wbi_img.sub_url);
-      const TAB = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
-        33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17,
-        0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52];
-      const mixin = TAB.map((i) => raw[i] || '').join('').slice(0, 32);
-      const params = { id: String(roomid), type: '0', wts: String(Math.floor(Date.now() / 1000)) };
-      const query = Object.keys(params).sort().map((k) => {
-        const v = String(params[k]).replace(/[!'()*]/g, '');
-        return encodeURIComponent(k) + '=' + encodeURIComponent(v);
-      }).join('&');
-      const url = 'https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?' +
-        query + '&w_rid=' + md5(query + mixin);
-      const r = await fetch(url, { credentials: 'include' }).then((x) => x.json());
-      if (r && r.data && r.data.token && r.data.host_list && r.data.host_list.length) return r;
-      logWarn('getDanmuInfo(WBI) refused', r && r.code, r && r.message);
+      const query = signDanmuQuery(roomid, nav);
+      if (!query) {
+        logWarn('getDanmuInfo wbi key missing');
+        return null;
+      }
+      const url = 'https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?' + query;
+      const r = await pageFetch(url);
+      const payload = danmuPayload(r);
+      if (payload) return payload;
+      logWarn('getDanmuInfo refused', r && r.code, r && r.message);
+      if (!triedBuvid && r && r.code === -352) {
+        await pageFetch('https://api.bilibili.com/x/frontend/finger/spi');
+        navCache = null;
+        return fetchDanmuInfo(roomid, await fetchNav(), true);
+      }
     } catch (e) {
-      logWarn('getDanmuInfo(WBI) failed', e.name, e.message);
+      logWarn('getDanmuInfo failed', e.name, e.message);
     }
     return null;
   }
@@ -1144,15 +1491,13 @@
       const op = dv.getUint32(8);
       if (total < headLen || off + total > buf.byteLength) break;
       const body = new Uint8Array(buf, off + headLen, total - headLen);
-      if (ver === 2) {
+      if (ver === 2 || ver === 3) {
         try {
-          const out = await inflateZlib(body);
+          const out = await inflateFormat(body, ver === 3 ? 'brotli' : 'deflate');
           await parseWsBuffer(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
         } catch (e) {
-          if (!wsWarned) { wsWarned = true; logWarn('ws inflate failed', e.name, e.message); }
+          if (!wsWarned) { wsWarned = true; logWarn(ver === 3 ? 'ws brotli frame' : 'ws inflate failed', e && e.message); }
         }
-      } else if (ver === 3) {
-        if (!wsWarned) { wsWarned = true; logWarn('ws brotli frame; protover 2 was not applied'); }
       } else if (op === 5) {
         parseDanmuJson(new TextDecoder().decode(body));
       }
@@ -1160,9 +1505,9 @@
     }
   }
 
-  async function inflateZlib(bytes) {
+  async function inflateFormat(bytes, format) {
     if (typeof DecompressionStream === 'undefined') throw new Error('DecompressionStream unavailable');
-    const ds = new DecompressionStream('deflate');
+    const ds = new DecompressionStream(format);
     const stream = new Blob([bytes]).stream().pipeThrough(ds);
     const ab = await new Response(stream).arrayBuffer();
     return new Uint8Array(ab);
@@ -1247,6 +1592,10 @@
   }
 
   function stopDanmaku() {
+    if (state.pipClient) {
+      try { state.pipClient.stop(); } catch (_) { /* ignore */ }
+      state.pipClient = null;
+    }
     if (state.ws) { try { state.ws.close(); } catch (_) { /* ignore */ } state.ws = null; }
     if (state.dm && state.dm.observer) {
       try { state.dm.observer.disconnect(); } catch (_) { /* ignore */ }
