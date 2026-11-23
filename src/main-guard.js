@@ -48,6 +48,9 @@
 
   function forward(data) {
     try {
+      // Own PiP socket is the steady path. Copying every frame into postMessage
+      // costs a main-thread clone on each live tab, which shows up once two rooms play.
+      if (!document.documentElement.hasAttribute('data-bmp-ws-tap')) return;
       const post = (d) => {
         try { window.top.postMessage({ __bmpWs: true, data: d }, '*'); } catch (_) { /* ignore */ }
       };
@@ -78,6 +81,33 @@
   for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) Patched[k] = Orig[k];
   Patched.__bmpWsPatched = true;
   window.WebSocket = Patched;
+})();
+
+// MAIN world: drop the player's per-frame FPS probe. That rAF forces a style
+// recalc of every CSS-animated danmaku node (Chromium bug). Two live tabs make
+// the recalc hitch about once per keyframe.
+(() => {
+  const orig = window.requestAnimationFrame;
+  if (!orig || orig.__bmpFps) return;
+  const skip = new WeakSet();
+  const keep = new WeakSet();
+  const wrapped = function (fn) {
+    if (typeof fn === 'function') {
+      if (skip.has(fn)) return 0;
+      if (!keep.has(fn)) {
+        let src = '';
+        try { src = String(fn); } catch (_) { /* ignore */ }
+        if (src.length < 1000 && src.indexOf('.fpsArr.') !== -1) {
+          skip.add(fn);
+          return 0;
+        }
+        keep.add(fn);
+      }
+    }
+    return orig.apply(this, arguments);
+  };
+  wrapped.__bmpFps = true;
+  window.requestAnimationFrame = wrapped;
 })();
 
 // MAIN world: expose the page's danmaku server config (token/host) to the content script.

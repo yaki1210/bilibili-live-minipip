@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Bilibili Live 弹幕小窗 (M2)",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "接管直播页「小窗模式」：置顶小窗里看直播画面和实时弹幕，离开直播页后弹幕继续更新。",
   "minimum_chrome_version": "116",
   "content_scripts": [

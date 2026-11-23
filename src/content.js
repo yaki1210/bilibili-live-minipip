@@ -264,154 +264,270 @@
     return null;
   }
 
-  // ---------- danmaku renderer (inside the PiP document) ----------
-  class DanmakuRenderer {
-    constructor(doc, layer) {
-      this.doc = doc;
-      this.layer = layer;
-      this.win = doc.defaultView;
-      this.enabled = true;
-      this.paused = false;
-      this.alive = true;
-      this.queue = [];
-      this.active = [];
-      this.tracks = [];
-      this.speed = 130;
-      this.font = 18;
-      this.lineHeight = 24;
-      this.maxActive = 80;
-      this.rx = 0;
-      this.shown = 0;
-      this.dropped = 0;
-      this.resize();
-      this.tick = this.tick.bind(this);
-      this.raf = this.win.requestAnimationFrame(this.tick);
+  // One canvas per PiP window. Per-span CSS/WAAPI animations plus a perpetual
+  // requestAnimationFrame make Chromium restyle every animated node every frame.
+  // Two live rooms then hitch on each video keyframe, which arrives about every 2s.
+  function createCanvasDanmaku(doc, layer) {
+    const win = doc.defaultView;
+    const canvas = doc.createElement('canvas');
+    canvas.className = 'bmp-dm-canvas';
+    canvas.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;pointer-events:none';
+    layer.append(canvas);
+    const ctx = canvas.getContext('2d', { alpha: true, desynchronized: true }) || canvas.getContext('2d');
+
+    const speed = 130;
+    let enabled = true;
+    let paused = false;
+    let alive = true;
+    let running = false;
+    let raf = 0;
+    let last = 0;
+    let font = 18;
+    let lineHeight = 24;
+    let dpr = 1;
+    let width = 0;
+    let height = 0;
+    let fontCss = '';
+    const queue = [];
+    const active = [];
+    let tracks = [];
+    let rx = 0;
+    let shown = 0;
+    let dropped = 0;
+
+    function applyFont() {
+      fontCss = '600 ' + font + 'px "Microsoft YaHei",system-ui,sans-serif';
+      if (ctx) ctx.font = fontCss;
     }
 
-    resize() {
-      const w = this.doc.documentElement.clientWidth || 480;
-      const h = this.doc.documentElement.clientHeight || 270;
-      this.font = Math.max(12, Math.min(22, Math.round(h / 18)));
-      this.lineHeight = Math.round(this.font * 1.35);
-      const usable = Math.max(this.lineHeight * 3, h - 64);
-      const count = Math.max(3, Math.min(10, Math.floor(usable / this.lineHeight)));
-      this.tracks = Array.from({ length: count }, (_, i) => ({ top: 8 + i * this.lineHeight, freeAt: 0 }));
-      this.layer.style.fontSize = this.font + 'px';
+    function measure(it) {
+      if (!ctx) return 0;
+      ctx.font = fontCss;
+      if (!it.spans) return ctx.measureText(it.text || '').width;
+      let w = 0;
+      for (const seg of it.spans) {
+        if (seg.type === 'image') w += seg.size + 2;
+        else {
+          seg.w = ctx.measureText(seg.text).width;
+          w += seg.w;
+        }
+      }
+      return w;
     }
 
-    push(item) {
-      if (!this.enabled) return;
-      this.rx++;
-      this.queue.push({ item, at: this.win.performance.now() });
-      if (this.queue.length > 30) {
-        this.queue.shift();
-        this.dropped++;
+    function resize() {
+      const w = layer.clientWidth || doc.documentElement.clientWidth || 480;
+      const h = layer.clientHeight || doc.documentElement.clientHeight || 270;
+      font = Math.max(12, Math.min(22, Math.round(h / 18)));
+      lineHeight = Math.round(font * 1.35);
+      const usable = Math.max(lineHeight * 3, h - 64);
+      const count = Math.max(3, Math.min(10, Math.floor(usable / lineHeight)));
+      tracks = Array.from({ length: count }, (_, i) => ({ top: 8 + i * lineHeight + lineHeight / 2, freeAt: 0 }));
+      dpr = Math.min(win.devicePixelRatio || 1, 2);
+      width = w;
+      height = h;
+      canvas.width = Math.max(1, Math.round(w * dpr));
+      canvas.height = Math.max(1, Math.round(h * dpr));
+      if (ctx) {
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        applyFont();
+        ctx.textBaseline = 'middle';
+        ctx.lineJoin = 'round';
+      }
+      for (const it of active) it.w = measure(it);
+    }
+
+    function spansOf(item) {
+      const segs = item.segments;
+      if (!segs || !segs.length) return null;
+      if (segs.length === 1 && segs[0].type !== 'image') return null;
+      const spans = [];
+      const size = Math.round(font * 1.3);
+      for (const seg of segs) {
+        if (seg.type === 'image' && seg.src) {
+          const img = new win.Image();
+          img.src = seg.src;
+          spans.push({ type: 'image', img, size });
+        } else if (seg.text) {
+          spans.push({ type: 'text', text: seg.text });
+        }
+      }
+      return spans.length ? spans : null;
+    }
+
+    function textOf(item) {
+      if (item.text) return String(item.text);
+      if (!item.segments) return '';
+      let s = '';
+      for (const seg of item.segments) if (seg.text) s += seg.text;
+      return s;
+    }
+
+    function push(item) {
+      if (!enabled || !alive || !item) return;
+      rx++;
+      const spans = spansOf(item);
+      const text = spans ? '' : textOf(item);
+      if (!spans && !text) return;
+      queue.push({ item, spans, text, at: win.performance.now() });
+      if (queue.length > 30) {
+        queue.shift();
+        dropped++;
+      }
+      kick();
+    }
+
+    function admit(entry, track, now) {
+      const it = {
+        text: entry.text,
+        spans: entry.spans,
+        color: (entry.item && entry.item.color) || '#ffffff',
+        x: width,
+        y: track.top,
+        w: 0,
+      };
+      it.w = measure(it);
+      track.freeAt = now + (it.w + 28) / speed * 1000;
+      active.push(it);
+      shown++;
+      if (active.length > 60) active.shift();
+    }
+
+    function draw() {
+      if (!ctx || !width || !height) return;
+      ctx.clearRect(0, 0, width, height);
+      ctx.font = fontCss;
+      ctx.lineWidth = Math.max(2, Math.round(font / 8));
+      ctx.strokeStyle = 'rgba(0,0,0,0.92)';
+      ctx.lineJoin = 'round';
+      ctx.textBaseline = 'middle';
+      for (const it of active) {
+        if (!it.spans) {
+          const x = Math.round(it.x);
+          ctx.strokeText(it.text, x, it.y);
+          ctx.fillStyle = it.color;
+          ctx.fillText(it.text, x, it.y);
+          continue;
+        }
+        let x = it.x;
+        for (const seg of it.spans) {
+          if (seg.type === 'image') {
+            if (seg.img.complete && seg.img.naturalWidth) {
+              ctx.drawImage(seg.img, Math.round(x), Math.round(it.y - seg.size / 2), seg.size, seg.size);
+            }
+            x += seg.size + 2;
+          } else {
+            const px = Math.round(x);
+            ctx.strokeText(seg.text, px, it.y);
+            ctx.fillStyle = it.color;
+            ctx.fillText(seg.text, px, it.y);
+            x += seg.w || 0;
+          }
+        }
       }
     }
 
-    tick() {
-      if (!this.alive) return;
-      const now = this.win.performance.now();
-      if (!this.paused) {
+    function frame(now) {
+      if (!alive) return;
+      raf = 0;
+      if (!width) resize();
+      if (enabled && !paused) {
         let n = 0;
-        while (this.queue.length && n < 2) {
-          const head = this.queue[0];
+        while (queue.length && n < 4) {
+          const head = queue[0];
           if (now - head.at > 1500) {
-            this.queue.shift();
-            this.dropped++;
+            queue.shift();
+            dropped++;
             continue;
           }
-          const track = this.tracks.find((t) => t.freeAt <= now);
+          const track = tracks.find((t) => t.freeAt <= now);
           if (!track) break;
-          this.queue.shift();
-          this.show(head.item, track, now);
+          admit(queue.shift(), track, now);
           n++;
         }
-      }
-      this.raf = this.win.requestAnimationFrame(this.tick);
-    }
-
-    show(item, track, now) {
-      const d = this.doc;
-      const el = d.createElement('span');
-      el.className = 'bmp-dm';
-      el.style.top = track.top + 'px';
-      el.style.color = item.color || '#ffffff';
-      for (const seg of item.segments) {
-        if (seg.type === 'image') {
-          const img = d.createElement('img');
-          img.src = seg.src;
-          img.alt = seg.alt || '';
-          img.style.width = Math.round(this.font * 1.3) + 'px';
-          img.style.height = Math.round(this.font * 1.3) + 'px';
-          img.onerror = () => {
-            try { img.replaceWith(d.createTextNode('[' + (seg.alt || '表情') + ']')); } catch (_) { /* ignore */ }
-          };
-          el.append(img);
-        } else {
-          el.append(d.createTextNode(seg.text));
+        const dt = last ? Math.min(50, now - last) : 16;
+        last = now;
+        const dx = speed * dt / 1000;
+        for (let i = active.length - 1; i >= 0; i--) {
+          const it = active[i];
+          it.x -= dx;
+          if (it.x + it.w < 0) active.splice(i, 1);
         }
+      } else {
+        last = now;
       }
-      this.layer.append(el);
-
-      const w = el.offsetWidth || 0;
-      const layerW = this.layer.clientWidth || 480;
-      const dist = layerW + w;
-      const dur = Math.max(600, Math.round(dist / this.speed * 1000));
-      const anim = el.animate(
-        [{ transform: 'translateX(0)' }, { transform: 'translateX(-' + dist + 'px)' }],
-        { duration: dur, easing: 'linear' }
-      );
-      anim.onfinish = () => { try { el.remove(); } catch (_) { /* ignore */ } };
-      if (this.paused) { try { anim.pause(); } catch (_) { /* ignore */ } }
-
-      track.freeAt = now + Math.round((w + 28) / this.speed * 1000);
-      this.active.push(el);
-      this.shown++;
-      if (this.active.length > this.maxActive) {
-        const old = this.active.shift();
-        try { old.remove(); } catch (_) { /* ignore */ }
+      draw();
+      if (alive && enabled && !paused && (active.length || queue.length)) {
+        raf = win.requestAnimationFrame(frame);
+      } else {
+        running = false;
       }
     }
 
-    setEnabled(on) {
-      this.enabled = !!on;
-      if (!on) {
-        this.queue = [];
-        for (const el of this.active) { try { el.remove(); } catch (_) { /* ignore */ } }
-        this.active = [];
-        this.tracks.forEach((t) => { t.freeAt = 0; });
-      }
+    function kick() {
+      if (!alive || running || !enabled || paused) return;
+      running = true;
+      last = 0;
+      raf = win.requestAnimationFrame(frame);
     }
 
-    pause() {
-      this.paused = true;
-      for (const el of this.active) {
-        const anims = el.getAnimations ? el.getAnimations() : [];
-        anims.forEach((a) => { try { a.pause(); } catch (_) { /* ignore */ } });
-      }
+    function clearAll() {
+      queue.length = 0;
+      active.length = 0;
+      for (const t of tracks) t.freeAt = 0;
+      if (ctx && width && height) ctx.clearRect(0, 0, width, height);
     }
 
-    resume() {
-      this.paused = false;
-      for (const el of this.active) {
-        const anims = el.getAnimations ? el.getAnimations() : [];
-        anims.forEach((a) => { try { a.play(); } catch (_) { /* ignore */ } });
-      }
+    resize();
+
+    return {
+      push,
+      resize,
+      get enabled() { return enabled; },
+      setEnabled(on) {
+        enabled = !!on;
+        if (!on) {
+          clearAll();
+          if (raf) { try { win.cancelAnimationFrame(raf); } catch (_) { /* ignore */ } raf = 0; }
+          running = false;
+        }
+      },
+      pause() { paused = true; },
+      resume() { paused = false; kick(); },
+      stats() {
+        return { rx, shown, dropped, queue: queue.length, active: active.length };
+      },
+      destroy() {
+        alive = false;
+        if (raf) { try { win.cancelAnimationFrame(raf); } catch (_) { /* ignore */ } }
+        raf = 0;
+        running = false;
+        clearAll();
+        try { canvas.remove(); } catch (_) { /* ignore */ }
+      },
+    };
+  }
+
+  class DanmakuRenderer {
+    constructor(doc, layer) {
+      this.core = createCanvasDanmaku(doc, layer);
     }
 
-    stats() {
-      return { rx: this.rx, shown: this.shown, dropped: this.dropped, queue: this.queue.length, active: this.active.length };
-    }
+    get enabled() { return this.core.enabled; }
 
-    destroy() {
-      this.alive = false;
-      try { this.win.cancelAnimationFrame(this.raf); } catch (_) { /* ignore */ }
-      for (const el of this.active) { try { el.remove(); } catch (_) { /* ignore */ } }
-      this.active = [];
-      this.queue = [];
-      try { this.layer.replaceChildren(); } catch (_) { /* ignore */ }
-    }
+    resize() { this.core.resize(); }
+
+    push(item) { this.core.push(item); }
+
+    setEnabled(on) { this.core.setEnabled(on); }
+
+    pause() { this.core.pause(); }
+
+    resume() { this.core.resume(); }
+
+    stats() { return this.core.stats(); }
+
+    destroy() { this.core.destroy(); }
   }
 
   // ---------- PiP DOM (mirror path) ----------
@@ -422,11 +538,7 @@
     st.textContent = [
       'html,body{margin:0!important;padding:0!important;width:100%;height:100%;background:#000!important;overflow:hidden!important}',
       '.bmp-video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;z-index:1}',
-      '.bmp-danmaku{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:2;' +
-        'font-family:"Microsoft YaHei",system-ui,sans-serif;font-weight:600;' +
-        'text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000}',
-      '.bmp-dm{position:absolute;left:100%;white-space:nowrap;line-height:1.35;will-change:transform}',
-      '.bmp-dm img{vertical-align:middle;margin:0 1px}',
+      '.bmp-danmaku{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:2;contain:content}',
       '.bmp-center{position:absolute;inset:0;display:none;align-items:center;justify-content:center;z-index:3;pointer-events:none}',
       '.bmp-center button{pointer-events:auto;padding:10px 22px;border:0;border-radius:22px;' +
         'background:rgba(0,0,0,.65);color:#fff;font:14px system-ui;cursor:pointer}',
@@ -635,14 +747,11 @@
     const st = d.createElement('style');
     st.id = 'bmp-dm-style';
     st.textContent = [
-      '.bmp-danmaku{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:6;' +
-        'font-family:"Microsoft YaHei",system-ui,sans-serif;font-weight:600;' +
-        'text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000}',
-      '.bmp-dm{position:absolute;left:100%;white-space:nowrap;line-height:1.35;will-change:transform}',
+      '.bmp-danmaku{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:6;contain:content}',
       '.bmp-badge{position:absolute;top:6px;right:8px;z-index:7;font:11px system-ui;' +
         'color:rgba(255,255,255,.75);background:rgba(0,0,0,.45);padding:2px 6px;border-radius:4px;' +
         'pointer-events:none;white-space:nowrap}',
-      'html.bmp-dm-live .web-player-danmaku, html.bmp-dm-live .danmaku-item-container{visibility:hidden!important}',
+      'html.bmp-dm-live .web-player-danmaku, html.bmp-dm-live .danmaku-item-container{display:none!important}',
     ].join('');
     (d.head || d.documentElement).append(st);
     const layer = d.createElement('div');
@@ -973,13 +1082,11 @@
     const setInterval = win.setInterval.bind(win);
     const clearInterval = win.clearInterval.bind(win);
     const setTimeout = win.setTimeout.bind(win);
-    const requestAnimationFrame = win.requestAnimationFrame.bind(win);
-    const performance = win.performance;
     const DecompressionStream = win.DecompressionStream || globalThis.DecompressionStream;
     const Blob = win.Blob;
     const Response = win.Response;
     const TextEncoder = win.TextEncoder;
-    const TextDecoder = win.TextDecoder;
+    const decoder = new win.TextDecoder();
     const ArrayBufferRef = win.ArrayBuffer;
 
     const st = {
@@ -994,15 +1101,24 @@
       alive: true,
       enabled: true,
       seen: new Set(),
-      queue: [],
-      active: [],
-      tracks: [],
-      font: 18,
       count: 0,
+      statusText: '弹幕：连接中…',
     };
 
+    let board = null;
+    let badgeQueued = false;
+
     function layer() { return document.getElementById('bmp-dm-layer'); }
+    function dm() {
+      if (board) return board;
+      const el = layer();
+      if (!el) return null;
+      board = createCanvasDanmaku(document, el);
+      if (!st.enabled) board.setEnabled(false);
+      return board;
+    }
     function setStatus(text) {
+      st.statusText = text;
       const line = st.count ? text + ' · ' + st.count : text;
       const badge = document.getElementById('bmp-dm-badge');
       const status = document.querySelector('.bmp-status');
@@ -1011,58 +1127,20 @@
       document.documentElement.setAttribute('data-bmp-dm-state', text);
       document.documentElement.setAttribute('data-bmp-dm-count', String(st.count));
     }
+    function noteCount() {
+      st.count++;
+      if (badgeQueued) return;
+      badgeQueued = true;
+      setStatus(st.statusText);
+      setTimeout(function () {
+        badgeQueued = false;
+        if (st.alive) setStatus(st.statusText);
+      }, 500);
+    }
 
     function resize() {
-      const el = layer();
-      if (!el) return;
-      const h = document.documentElement.clientHeight || 270;
-      const font = Math.max(12, Math.min(22, Math.round(h / 18)));
-      const lh = Math.round(font * 1.35);
-      const usable = Math.max(lh * 3, h - 64);
-      const count = Math.max(3, Math.min(10, Math.floor(usable / lh)));
-      st.font = font;
-      st.tracks = Array.from({ length: count }, function (_, i) { return { top: 8 + i * lh, freeAt: 0 }; });
-      el.style.fontSize = font + 'px';
-    }
-
-    function paint(item, track, now) {
-      const elLayer = layer();
-      if (!elLayer) return;
-      const node = document.createElement('span');
-      node.className = 'bmp-dm';
-      node.style.top = track.top + 'px';
-      node.style.color = item.color || '#ffffff';
-      node.textContent = item.text;
-      elLayer.append(node);
-      const w = node.offsetWidth || 0;
-      const dist = (elLayer.clientWidth || 480) + w;
-      const speed = 130;
-      const anim = node.animate(
-        [{ transform: 'translateX(0)' }, { transform: 'translateX(-' + dist + 'px)' }],
-        { duration: Math.max(600, Math.round(dist / speed * 1000)), easing: 'linear' }
-      );
-      anim.onfinish = function () { try { node.remove(); } catch (e) { /* ignore */ } };
-      track.freeAt = now + Math.round((w + 28) / speed * 1000);
-      st.active.push(node);
-      if (st.active.length > 80) {
-        const old = st.active.shift();
-        try { old.remove(); } catch (e) { /* ignore */ }
-      }
-    }
-
-    function pump() {
-      if (!st.alive) return;
-      const now = performance.now();
-      if (st.enabled) {
-        let n = 0;
-        while (st.queue.length && n < 2) {
-          const track = st.tracks.find(function (t) { return t.freeAt <= now; });
-          if (!track) break;
-          paint(st.queue.shift(), track, now);
-          n++;
-        }
-      }
-      requestAnimationFrame(pump);
+      const b = dm();
+      if (b) b.resize();
     }
 
     function colorOf(raw) {
@@ -1078,11 +1156,10 @@
       if (st.seen.has(key)) return;
       st.seen.add(key);
       if (st.seen.size > 800) st.seen.clear();
-      st.count++;
-      setStatus(document.documentElement.getAttribute('data-bmp-dm-state') || '弹幕：WebSocket');
+      noteCount();
       if (!st.enabled) return;
-      st.queue.push(item);
-      if (st.queue.length > 40) st.queue.shift();
+      const b = dm();
+      if (b) b.push(item);
     }
 
     function sendPacket(ws, op, body) {
@@ -1118,15 +1195,14 @@
         if (ver === 2 || ver === 3) {
           try {
             const out = await inflate(body, ver === 3 ? 'brotli' : 'deflate');
-            await parseBuf(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+            await parseBuf(out.buffer);
           } catch (e) {
             const n = Number(document.documentElement.getAttribute('data-bmp-dm-decode-fail') || 0) + 1;
             document.documentElement.setAttribute('data-bmp-dm-decode-fail', String(n));
           }
         } else if (op === 5) {
           let obj;
-          try { obj = JSON.parse(new TextDecoder().decode(body)); } catch (e) { obj = null; }
-          if (obj && obj.cmd) document.documentElement.setAttribute('data-bmp-dm-last-cmd', String(obj.cmd).slice(0, 40));
+          try { obj = JSON.parse(decoder.decode(body)); } catch (e) { obj = null; }
           if (obj && String(obj.cmd || '').indexOf('DANMU_MSG') === 0 && Array.isArray(obj.info)) {
             const info = obj.info;
             const text = String(info[1] || '').trim();
@@ -1148,6 +1224,7 @@
       st.gen++;
       if (st.hb) { clearInterval(st.hb); st.hb = 0; }
       if (st.ws) { try { st.ws.close(); } catch (e) { /* ignore */ } st.ws = null; }
+      if (board) { try { board.destroy(); } catch (e) { /* ignore */ } board = null; }
     }
 
     function connect() {
@@ -1172,8 +1249,6 @@
         setStatus('弹幕：WebSocket');
       };
       ws.onmessage = function (ev) {
-        const n = Number(document.documentElement.getAttribute('data-bmp-dm-frames') || 0) + 1;
-        document.documentElement.setAttribute('data-bmp-dm-frames', String(n));
         const take = function (data) {
           if (data instanceof ArrayBufferRef) parseBuf(data).catch(function () {});
         };
@@ -1201,7 +1276,6 @@
 
     win.addEventListener('resize', resize);
     resize();
-    requestAnimationFrame(pump);
 
     return {
       start: function (cfg) {
@@ -1210,11 +1284,15 @@
         st.auth = (cfg && cfg.auth) || {};
         st.enabled = !cfg || cfg.enabled !== false;
         st.started = true;
+        if (board) board.setEnabled(st.enabled);
         resize();
         connect();
       },
       stop: shutdown,
-      setEnabled: function (on) { st.enabled = !!on; },
+      setEnabled: function (on) {
+        st.enabled = !!on;
+        if (board) board.setEnabled(on);
+      },
     };
   }
 
@@ -1440,9 +1518,19 @@
     } catch (_) { return false; }
   }
 
+  function setWsTap(doc, on) {
+    if (!doc || !doc.documentElement) return;
+    if (on) doc.documentElement.setAttribute('data-bmp-ws-tap', '1');
+    else doc.documentElement.removeAttribute('data-bmp-ws-tap');
+    for (const frame of doc.querySelectorAll('iframe')) {
+      try { setWsTap(frame.contentDocument, on); } catch (_) { /* cross-origin */ }
+    }
+  }
+
   function startWsDanmaku() {
     if (state.wsListening) return;
     state.wsListening = true;
+    setWsTap(document, true);
     state.wsSeen = new Set();
     state.wsChain = Promise.resolve();
     const onMsg = (ev) => {
@@ -1494,7 +1582,7 @@
       if (ver === 2 || ver === 3) {
         try {
           const out = await inflateFormat(body, ver === 3 ? 'brotli' : 'deflate');
-          await parseWsBuffer(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+          await parseWsBuffer(out.buffer);
         } catch (e) {
           if (!wsWarned) { wsWarned = true; logWarn(ver === 3 ? 'ws brotli frame' : 'ws inflate failed', e && e.message); }
         }
@@ -1535,7 +1623,9 @@
     if (state.renderer) {
       state.renderer.push({ segments: [{ type: 'text', text: t }], color, uname, text: t });
       state.dmCount = (state.dmCount || 0) + 1;
-      if (state.ui && state.ui.badge) {
+      const now = Date.now();
+      if (state.ui && state.ui.badge && now - (state.dmBadgeAt || 0) > 500) {
+        state.dmBadgeAt = now;
         state.ui.badge.textContent = (state.dmText || '弹幕') + ' · ' + state.dmCount;
       }
     }
@@ -1592,6 +1682,7 @@
   }
 
   function stopDanmaku() {
+    setWsTap(document, false);
     if (state.pipClient) {
       try { state.pipClient.stop(); } catch (_) { /* ignore */ }
       state.pipClient = null;
